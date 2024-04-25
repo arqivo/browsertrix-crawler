@@ -1,10 +1,12 @@
 import sharp from "sharp";
+import fs from "fs";
 
 import { logger, formatErr } from "./logger.js";
 import { Browser } from "./browser.js";
 import { Page } from "puppeteer-core";
 import { PageState } from "./state.js";
 import { WARCWriter } from "./warcwriter.js";
+import { createHash } from "crypto";
 
 // ============================================================================
 
@@ -43,6 +45,7 @@ export type ScreenshotOpts = {
   page: Page;
   url: string;
   writer: WARCWriter;
+  directory: string;
 };
 
 export class Screenshots {
@@ -50,12 +53,25 @@ export class Screenshots {
   page: Page;
   url: string;
   writer: WARCWriter;
+  directory: string;
 
-  constructor({ browser, page, writer, url }: ScreenshotOpts) {
+  constructor({ browser, page, writer, url, directory }: ScreenshotOpts) {
+
     this.browser = browser;
     this.page = page;
     this.url = url;
     this.writer = writer;
+    this.directory = directory;
+
+    if (!fs.existsSync(this.directory + '/screenshots')){
+        fs.mkdir(this.directory + '/screenshots', (err:any) => {
+            if (err) {
+                console.log('Failed to create screenshots dir: ', err);
+            }
+            console.log('Screenshots directory created successfully!');
+        });
+    }
+
   }
 
   async take(
@@ -111,25 +127,33 @@ export class Screenshots {
       await this.browser.setViewport(this.page, { width: 1920, height: 1080 });
       const options = screenshotTypes[screenshotType];
       const screenshotBuffer = await this.page.screenshot(options);
-      const thumbnailBuffer = await sharp(screenshotBuffer)
+    //   const thumbnailBuffer = await sharp(screenshotBuffer)
+    //     // 16:9 thumbnail
+    //     .resize(640, 360)
+    //     .toBuffer();
+
+    //   this.writer.writeNewResourceRecord(
+    //     {
+    //       buffer: thumbnailBuffer,
+    //       resourceType: screenshotType,
+    //       contentType: "image/" + options.type,
+    //       url: this.url,
+    //     },
+    //     {
+    //       resource: "screenshot",
+    //       type: screenshotType,
+    //       url: this.url,
+    //       filename: this.writer.filename,
+    //     },
+    //     "screenshots",
+    //   );
+
+      const hash = createHash('sha256').update(this.url).digest('hex');
+      await sharp(screenshotBuffer)
         // 16:9 thumbnail
         .resize(640, 360)
-        .toBuffer();
-      this.writer.writeNewResourceRecord(
-        {
-          buffer: thumbnailBuffer,
-          resourceType: screenshotType,
-          contentType: "image/" + options.type,
-          url: this.url,
-        },
-        {
-          resource: "screenshot",
-          type: screenshotType,
-          url: this.url,
-          filename: this.writer.filename,
-        },
-        "screenshots",
-      );
+        .toFile(this.directory + '/screenshots/' + hash + '.jpg');
+
     } catch (e) {
       logger.error(
         "Taking screenshot failed",

@@ -61,6 +61,7 @@ import { Recorder } from "./util/recorder.js";
 import { SitemapReader } from "./util/sitemapper.js";
 import { ScopedSeed } from "./util/seeds.js";
 import { WARCWriter } from "./util/warcwriter.js";
+import { Actions } from "./actions/index.js";
 
 const HTTPS_AGENT = new HTTPSAgent({
   rejectUnauthorized: false,
@@ -858,6 +859,7 @@ self.__bx_behaviors.selectMainBehavior();
         page,
         url,
         writer: this.screenshotWriter,
+        directory: this.collDir
       });
       if (this.params.screenshot.includes("view")) {
         await screenshots.take("view", saveOutput ? data : null);
@@ -926,6 +928,9 @@ self.__bx_behaviors.selectMainBehavior();
         }
       }
     }
+
+    // Run custom action
+    await Actions.runPostLoad(url, page, logger, logDetails);
 
     if (this.params.pageExtraDelay) {
       logger.info(

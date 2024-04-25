@@ -66,7 +66,9 @@ export class ScopedSeed {
         parsedUrl,
       );
       this.include = [...includeNew, ...this.include];
-      allowHash = allowHashNew;
+      if(!allowHash && allowHashNew){
+        allowHash = allowHashNew;
+      }
     }
 
     // for page scope, the depth is set to extraHops, as no other

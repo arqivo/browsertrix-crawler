@@ -665,6 +665,7 @@ class ArgParser {
         exclude: argv.exclude,
         depth: argv.depth,
         extraHops: argv.extraHops,
+        allowHash: argv.allowHashUrls,
       };
 
       for (let seed of argv.seeds) {
