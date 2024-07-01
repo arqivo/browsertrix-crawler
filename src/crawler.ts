@@ -42,6 +42,7 @@ import { sleep, timedRun, secondsElapsed } from "./util/timing.js";
 import { collectAllFileSources, getInfoString } from "./util/file_reader.js";
 
 import { Browser } from "./util/browser.js";
+// import { HtmlExtract } from "./util/htmlextract.js";
 
 import {
   ADD_LINK_FUNC,
@@ -454,6 +455,7 @@ export class Crawler {
     await fsp.mkdir(this.archivesDir, { recursive: true });
     await fsp.mkdir(this.tempdir, { recursive: true });
     await fsp.mkdir(this.tempCdxDir, { recursive: true });
+    await fsp.mkdir(this.collDir + "/html", { recursive: true });    
 
     this.logFH = fs.createWriteStream(this.logFilename, { flags: "a" });
     logger.setExternalLogStream(this.logFH);
@@ -890,6 +892,11 @@ self.__bx_behaviors.selectMainBehavior();
         data.text = text;
       }
     }
+    
+    // // Save HTML to file
+    // if (data.isHTMLPage) {
+    //     HtmlExtract.extract(this.collDir, page, url);
+    // }
 
     data.loadState = LoadState.EXTRACTION_DONE;
 
@@ -930,7 +937,7 @@ self.__bx_behaviors.selectMainBehavior();
     }
 
     // Run custom action
-    await Actions.runPostLoad(url, page, logger, logDetails);
+    await Actions.runPostLoad(url, page, logger, logDetails, this, data);
 
     if (this.params.pageExtraDelay) {
       logger.info(
@@ -1183,7 +1190,15 @@ self.__bx_behaviors.selectMainBehavior();
     await this.closeLog();
 
     if (this.crawlState && status) {
+
       await this.crawlState.setStatus(status);
+
+      if(status == 'done'){
+        
+        await this.crawlState.cleanupRedis();
+
+      }
+
     }
     process.exit(exitCode);
   }

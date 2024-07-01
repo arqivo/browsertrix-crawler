@@ -291,7 +291,7 @@ export class PageWorker {
       await this.closePage();
     } finally {
       try {
-        if (this.recorder) {
+        if (this.recorder && this.crawler.params.writePageInfo) {
           opts.data.ts = this.recorder.writePageInfoRecord();
         }
       } catch (e) {

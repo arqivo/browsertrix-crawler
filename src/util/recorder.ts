@@ -1,5 +1,5 @@
 import path from "path";
-
+import { createHash } from "crypto";
 import { v4 as uuidv4 } from "uuid";
 
 import PQueue from "p-queue";
@@ -1030,12 +1030,20 @@ export class Recorder {
       return;
     }
 
+    let dupeHash = createHash('sha256').update(url + payload).digest('hex');
+
+    logger.debug(
+        "Dupe check",
+        { url: url, dupeHash: dupeHash },
+        "general",
+      );
+
     if (
       url &&
       method === "GET" &&
-      !(await this.crawlState.addIfNoDupe(WRITE_DUPE_KEY, url))
+      !(await this.crawlState.addIfNoDupe(WRITE_DUPE_KEY, dupeHash))
     ) {
-      logNetwork("Skipping dupe", { url });
+      logNetwork("Skipping dupe", { url, hash: dupeHash });
       return;
     }
 
@@ -1239,11 +1247,39 @@ class AsyncFetcher {
         );
       }
 
-      recorder.writer.writeRecordPair(
-        responseRecord,
-        requestRecord,
-        serializer,
+      
+
+      let dupeHash = createHash('sha256').update(url + reqresp.payload).digest('hex');
+
+
+      logger.debug(
+        "Dupe check in load method",
+        { url, dupeHash: dupeHash },
+        "recorder",
       );
+
+      let shouldSkipDupe = false;
+
+      if (
+        reqresp.method === "GET" &&
+        url &&
+        !(await crawlState.addIfNoDupe(WRITE_DUPE_KEY, dupeHash))
+      ) {
+        logger.debug(
+            "Skipping dupe in load method",
+            { url, dupeHash: dupeHash },
+            "recorder",
+          );
+        shouldSkipDupe = true;
+      }
+      
+        if(!shouldSkipDupe){
+            recorder.writer.writeRecordPair(
+                responseRecord,
+                requestRecord,
+                serializer,
+            );
+        }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {

@@ -7,6 +7,16 @@ import { MAX_DEPTH } from "./constants.js";
 import { ScopedSeed } from "./seeds.js";
 import { Frame } from "puppeteer-core";
 
+// Add declarations
+declare module "ioredis" {
+    interface RedisCommander<Context> {
+    deleteWithPrefix(
+        key: string,
+        callback?: Callback<string>
+    ): Result<string, Context>;
+    }
+}
+
 // ============================================================================
 export enum LoadState {
   FAILED = 0,
@@ -838,4 +848,20 @@ return 0;
   async markSitemapDone() {
     await this.redis.set(this.sitemapDoneKey, "1");
   }
+
+  async cleanupRedis(){
+
+    if(this.key){
+
+        await this.redis.defineCommand("deleteWithPrefix", {
+            numberOfKeys: 0,
+            lua: "local keys = redis.call('keys', ARGV[1]) \n for i=1,#keys,5000 do \n redis.call('del', unpack(keys, i, math.min(i+4999, #keys))) \n end \n return keys"
+        });
+
+        await this.redis.deleteWithPrefix(this.key + ':*');
+
+    }
+
+  }
+
 }

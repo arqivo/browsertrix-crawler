@@ -115,6 +115,13 @@ class ArgParser {
         ],
       },
 
+      writePageInfo: {
+        describe:
+          "Write page info records to warc",
+        type: "boolean",
+        default: true 
+      },
+
       scopeIncludeRx: {
         alias: "include",
         describe:

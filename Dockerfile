@@ -1,8 +1,8 @@
 # docker buildx build --platform linux/amd64 -f Dockerfile -t arqivo-browsertrix-crawler .
 #
-# - docker tag arqivo-browsertrix-crawler:latest 851725346735.dkr.ecr.eu-central-1.amazonaws.com/arqivo-browsertrix-crawler:latest
+# - docker tag arqivo-browsertrix-crawler:latest 851725346735.dkr.ecr.eu-central-1.amazonaws.com/arqivo-browsertrix-crawler:1.1.0
 # - aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 851725346735.dkr.ecr.eu-central-1.amazonaws.com
-# - docker push 851725346735.dkr.ecr.eu-central-1.amazonaws.com/arqivo-browsertrix-crawler:latest
+# - docker push 851725346735.dkr.ecr.eu-central-1.amazonaws.com/arqivo-browsertrix-crawler:1.1.0
 
 ARG BROWSER_VERSION=1.64.109
 ARG BROWSER_IMAGE_BASE=webrecorder/browsertrix-browser-base:brave-${BROWSER_VERSION}
@@ -68,7 +68,7 @@ RUN ln -s /app/dist/main.js /usr/bin/crawl; \
 WORKDIR /crawls
 
 # enable to test custom behaviors build (from browsertrix-behaviors)
-# COPY behaviors.js /app/node_modules/browsertrix-behaviors/dist/behaviors.js
+COPY behaviors.js /app/node_modules/browsertrix-behaviors/dist/behaviors.js
 
 ADD docker-entrypoint.sh /docker-entrypoint.sh
 ENTRYPOINT ["/docker-entrypoint.sh"]
