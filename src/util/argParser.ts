@@ -122,6 +122,13 @@ class ArgParser {
         default: true 
       },
 
+      enableJavascript: {
+        describe:
+          "Enable javascript in the browser while crawling",
+        type: "boolean",
+        default: true 
+      },
+
       scopeIncludeRx: {
         alias: "include",
         describe:

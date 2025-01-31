@@ -900,7 +900,7 @@ self.__bx_behaviors.selectMainBehavior();
 
     data.loadState = LoadState.EXTRACTION_DONE;
 
-    if (this.params.behaviorOpts && data.status < 400) {
+    if (this.params.behaviorOpts && data.status < 400 && this.params.enableJavascript) {
       if (!data.isHTMLPage) {
         logger.debug(
           "Skipping behaviors for non-HTML page",
@@ -1720,6 +1720,11 @@ self.__bx_behaviors.selectMainBehavior();
     logger.info("Awaiting page load", logDetails);
 
     try {
+
+      if(!this.params.enableJavascript){
+        await page.setJavaScriptEnabled(false);
+      }
+
       const resp = await page.goto(url, gotoOpts);
 
       if (!resp) {
