@@ -51,6 +51,7 @@ nav:
   - User Guide:
     - user-guide/index.md
     - user-guide/outputs.md
+    - user-guide/exit-codes.md
     - user-guide/common-options.md
     - user-guide/crawl-scope.md
     - user-guide/yaml-config.md
@@ -62,7 +63,7 @@ nav:
 
 markdown_extensions:
   - toc:
-      toc_depth: 3
+      toc_depth: 4
       permalink: true
   - pymdownx.highlight:
       anchor_linenums: true

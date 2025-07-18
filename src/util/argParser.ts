@@ -1,6 +1,6 @@
 import path from "path";
 import fs from "fs";
-import os from "os";
+import ISO6391 from "iso-639-1";
 
 import yaml from "js-yaml";
 import { KnownDevices as devices } from "puppeteer-core";
@@ -10,14 +10,16 @@ import { hideBin } from "yargs/helpers";
 import { createParser } from "css-selector-parser";
 
 import {
-  BEHAVIOR_LOG_FUNC,
   WAIT_UNTIL_OPTS,
   EXTRACT_TEXT_TYPES,
   SERVICE_WORKER_OPTS,
   DEFAULT_SELECTORS,
+  BEHAVIOR_TYPES,
   ExtractSelector,
+  DEFAULT_MAX_RETRIES,
+  BxFunctionBindings,
+  DEFAULT_CRAWL_ID_TEMPLATE,
 } from "./constants.js";
-import { ScopedSeed } from "./seeds.js";
 import { interpolateFilename } from "./storage.js";
 import { screenshotTypes } from "./screenshots.js";
 import {
@@ -34,11 +36,13 @@ export type CrawlerArgs = ReturnType<typeof parseArgs> & {
   logExcludeContext: LogContext[];
   text: string[];
 
-  scopedSeeds: ScopedSeed[];
-
   customBehaviors: string[];
 
   selectLinks: ExtractSelector[];
+
+  include: string[];
+  exclude: string[];
+  sitemap: boolean;
 
   crawlId: string;
 
@@ -97,7 +101,7 @@ class ArgParser {
         crawlId: {
           alias: "id",
           describe:
-            "A user provided ID for this crawl or crawl configuration (can also be set via CRAWL_ID env var, defaults to hostname)",
+            "A user provided ID for this crawl or crawl configuration (can also be set via CRAWL_ID env var), defaults to combination of Docker container hostname and collection",
           type: "string",
         },
 
@@ -179,11 +183,19 @@ class ArgParser {
         },
 
         selectLinks: {
+          alias: "linkSelector",
           describe:
             "One or more selectors for extracting links, in the format [css selector]->[property to use],[css selector]->@[attribute to use]",
           type: "array",
           default: ["a[href]->href"],
           coerce,
+        },
+
+        clickSelector: {
+          describe:
+            "Selector for elements to click when using the autoclick behavior",
+          type: "string",
+          default: "a",
         },
 
         blockRules: {
@@ -217,8 +229,7 @@ class ArgParser {
 
         collection: {
           alias: "c",
-          describe:
-            "Collection name to crawl to (replay will be accessible under this name in pywb preview)",
+          describe: "Collection name / directory to crawl into",
           type: "string",
           default: "crawl-@ts",
         },
@@ -236,8 +247,7 @@ class ArgParser {
 
         generateCDX: {
           alias: ["generatecdx", "generateCdx"],
-          describe:
-            "If set, generate index (CDXJ) for use with pywb after crawl is done",
+          describe: "If set, generate merged index in CDXJ format",
           type: "boolean",
           default: false,
         },
@@ -258,6 +268,13 @@ class ArgParser {
         generateWACZ: {
           alias: ["generatewacz", "generateWacz"],
           describe: "If set, generate WACZ on disk",
+          type: "boolean",
+          default: false,
+        },
+
+        useSHA1: {
+          describe:
+            "If set, sha-1 instead of sha-256 hashes will be used for creating records",
           type: "boolean",
           default: false,
         },
@@ -313,7 +330,7 @@ class ArgParser {
 
         cwd: {
           describe:
-            "Crawl working directory for captures (pywb root). If not set, defaults to process.cwd()",
+            "Crawl working directory for captures. If not set, defaults to process.cwd()",
           type: "string",
           default: process.cwd(),
         },
@@ -365,7 +382,6 @@ class ArgParser {
           describe: "Which background behaviors to enable on each page",
           type: "array",
           default: ["autoplay", "autofetch", "autoscroll", "siteSpecific"],
-          choices: ["autoplay", "autofetch", "autoscroll", "siteSpecific"],
           coerce,
         },
 
@@ -389,13 +405,6 @@ class ArgParser {
             "If >0, amount of time to sleep (in seconds) after behaviors before moving on to next page",
           default: 0,
           type: "number",
-        },
-
-        dedupPolicy: {
-          describe: "Deduplication policy",
-          default: "skip",
-          type: "string",
-          choices: ["skip", "revisit", "keep"],
         },
 
         profile: {
@@ -474,7 +483,7 @@ class ArgParser {
           describe:
             "If set, save state and exit if disk utilization exceeds this percentage value",
           type: "number",
-          default: 90,
+          default: 0,
         },
 
         timeLimit: {
@@ -549,10 +558,24 @@ class ArgParser {
           default: false,
         },
 
+        logBehaviorsToRedis: {
+          describe: "If set, write behavior script messages to redis",
+          type: "boolean",
+          default: false,
+        },
+
         writePagesToRedis: {
           describe: "If set, write page objects to redis",
           type: "boolean",
           default: false,
+        },
+
+        maxPageRetries: {
+          alias: "retries",
+          describe:
+            "If set, number of times to retry a page that failed to load before page is considered to have failed",
+          type: "number",
+          default: DEFAULT_MAX_RETRIES,
         },
 
         failOnFailedSeed: {
@@ -586,6 +609,12 @@ class ArgParser {
             ' --customBehaviors "git+https://git.example.com/repo.git?branch=dev&path=some/dir"',
           type: "array",
           default: [],
+        },
+
+        saveStorage: {
+          describe:
+            "if set, will store the localStorage/sessionStorage data for each page as part of WARC-JSON-Metadata field",
+          type: "boolean",
         },
 
         debugAccessRedis: {
@@ -694,8 +723,14 @@ class ArgParser {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   validateArgs(argv: any, isQA: boolean) {
-    argv.crawlId = argv.crawlId || process.env.CRAWL_ID || os.hostname();
-    argv.collection = interpolateFilename(argv.collection, argv.crawlId);
+    argv.collection = interpolateFilename(argv.collection, "");
+    argv.crawlId = interpolateFilename(
+      argv.crawlId || process.env.CRAWL_ID || DEFAULT_CRAWL_ID_TEMPLATE,
+      argv.collection,
+    );
+
+    // css selector parser
+    const parser = createParser();
 
     // Check that the collection name is valid.
     if (argv.collection.search(/^[\w][\w-]*$/) === -1) {
@@ -707,9 +742,30 @@ class ArgParser {
     // background behaviors to apply
     const behaviorOpts: { [key: string]: string | boolean } = {};
     if (argv.behaviors.length > 0) {
-      argv.behaviors.forEach((x: string) => (behaviorOpts[x] = true));
-      behaviorOpts.log = BEHAVIOR_LOG_FUNC;
+      if (argv.clickSelector) {
+        try {
+          parser(argv.clickSelector);
+        } catch (e) {
+          logger.fatal("Invalid Autoclick CSS Selector", {
+            selector: argv.clickSelector,
+          });
+        }
+      }
+
+      argv.behaviors.forEach((x: string) => {
+        if (BEHAVIOR_TYPES.includes(x)) {
+          behaviorOpts[x] = true;
+        } else {
+          logger.warn(
+            "Unknown behavior specified, ignoring",
+            { behavior: x },
+            "behavior",
+          );
+        }
+      });
+      behaviorOpts.log = BxFunctionBindings.BehaviorLogFunc;
       behaviorOpts.startEarly = true;
+      behaviorOpts.clickSelector = argv.clickSelector;
       argv.behaviorOpts = JSON.stringify(behaviorOpts);
     } else {
       argv.behaviorOpts = "";
@@ -729,25 +785,13 @@ class ArgParser {
       argv.emulateDevice = { viewport: null };
     }
 
-    if (argv.seedFile) {
-      const urlSeedFile = fs.readFileSync(argv.seedFile, "utf8");
-      const urlSeedFileList = urlSeedFile.split("\n");
-
-      if (typeof argv.seeds === "string") {
-        argv.seeds = [argv.seeds];
-      }
-
-      for (const seed of urlSeedFileList) {
-        if (seed) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (argv.seeds as any).push(seed);
-        }
+    if (argv.lang) {
+      if (!ISO6391.validate(argv.lang)) {
+        logger.fatal("Invalid ISO-639-1 country code for --lang: " + argv.lang);
       }
     }
 
     let selectLinks: ExtractSelector[];
-
-    const parser = createParser();
 
     if (argv.selectLinks) {
       selectLinks = argv.selectLinks.map((x: string) => {
@@ -778,50 +822,9 @@ class ArgParser {
       //logger.debug(`Set netIdleWait to ${argv.netIdleWait} seconds`);
     }
 
-    const scopedSeeds: ScopedSeed[] = [];
-
-    if (!isQA) {
-      const scopeOpts = {
-        scopeType: argv.scopeType,
-        sitemap: argv.sitemap,
-        include: argv.include,
-        exclude: argv.exclude,
-        depth: argv.depth,
-        extraHops: argv.extraHops,
-        allowHash: argv.allowHashUrls,
-      };
-
-      for (const seed of argv.seeds) {
-        const newSeed = typeof seed === "string" ? { url: seed } : seed;
-
-        try {
-          scopedSeeds.push(new ScopedSeed({ ...scopeOpts, ...newSeed }));
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        } catch (e: any) {
-          logger.error("Failed to create seed", {
-            error: e.toString(),
-            ...scopeOpts,
-            ...newSeed,
-          });
-          if (argv.failOnFailedSeed) {
-            logger.fatal(
-              "Invalid seed specified, aborting crawl",
-              { url: newSeed.url },
-              "general",
-              1,
-            );
-          }
-        }
-      }
-
-      if (!scopedSeeds.length) {
-        logger.fatal("No valid seeds specified, aborting crawl");
-      }
-    } else if (!argv.qaSource) {
+    if (isQA && !argv.qaSource) {
       logger.fatal("--qaSource required for QA mode");
     }
-
-    argv.scopedSeeds = scopedSeeds;
 
     // Resolve statsFilename
     if (argv.statsFilename) {
@@ -830,6 +833,10 @@ class ArgParser {
 
     if (argv.diskUtilization < 0 || argv.diskUtilization > 99) {
       argv.diskUtilization = 90;
+    }
+
+    if (argv.saveStorage) {
+      logger.info("Saving localStorage and sessionStorage");
     }
 
     return true;

@@ -8,7 +8,7 @@ test("run initial crawl with text and screenshots to prepare for QA", async () =
   fs.rmSync("./test-crawls/qa-wr-net", { recursive: true, force: true });
 
   child_process.execSync(
-    "docker run -v $PWD/test-crawls:/crawls webrecorder/browsertrix-crawler crawl --url https://old.webrecorder.net/ --url https://old.webrecorder.net/about --url https://browsertrix.com/ --url https://old.webrecorder.net/contact --scopeType page --collection qa-wr-net --text to-warc --screenshot view --generateWACZ",
+    "docker run -v $PWD/test-crawls:/crawls webrecorder/browsertrix-crawler crawl --url https://old.webrecorder.net/ --url https://old.webrecorder.net/about --url https://archiveweb.page/ --url https://old.webrecorder.net/contact --scopeType page --collection qa-wr-net --text to-warc --screenshot view --generateWACZ",
   );
 
   expect(
@@ -59,6 +59,8 @@ test("run QA comparison, with write pages to redis", async () => {
     expect(json.comparison).toHaveProperty("screenshotMatch");
     expect(json.comparison).toHaveProperty("textMatch");
     expect(json.comparison).toHaveProperty("resourceCounts");
+    expect(json.comparison.screenshotMatch).toBe(1);
+    expect(json.comparison.textMatch).toBe(1);
 
     expect(json.comparison.resourceCounts).toHaveProperty("crawlGood");
     expect(json.comparison.resourceCounts).toHaveProperty("crawlBad");

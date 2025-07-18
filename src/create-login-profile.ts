@@ -15,8 +15,9 @@ import { Browser } from "./util/browser.js";
 import { initStorage } from "./util/storage.js";
 import { CDPSession, Page, PuppeteerLifeCycleEvent } from "puppeteer-core";
 import { getInfoString } from "./util/file_reader.js";
-import { DISPLAY } from "./util/constants.js";
+import { DISPLAY, ExitCodes } from "./util/constants.js";
 import { initProxy } from "./util/proxy.js";
+//import { sleep } from "./util/timing.js";
 
 const profileHTML = fs.readFileSync(
   new URL("../html/createProfile.html", import.meta.url),
@@ -146,7 +147,7 @@ function getDefaultWindowSize() {
 
 function handleTerminate(signame: string) {
   logger.info(`Got signal ${signame}, exiting`);
-  process.exit(1);
+  process.exit(ExitCodes.SignalInterrupted);
 }
 
 async function main() {
@@ -298,7 +299,7 @@ async function automatedProfile(
     }
     logger.debug("Login form could not be found");
     await page.close();
-    process.exit(1);
+    process.exit(ExitCodes.GenericError);
     return;
   }
 
@@ -317,7 +318,7 @@ async function automatedProfile(
 
   await createProfile(params, browser, page, cdp);
 
-  process.exit(0);
+  process.exit(ExitCodes.Success);
 }
 
 async function createProfile(
@@ -437,6 +438,27 @@ class InteractiveBrowser {
 
     // attempt to keep everything to initial tab if headless
     if (this.params.headless) {
+      void cdp.send("Target.setDiscoverTargets", { discover: true });
+
+      cdp.on("Target.targetCreated", async (params) => {
+        const { targetInfo } = params;
+        const { type, openerFrameId } = targetInfo;
+
+        if (type === "page" && openerFrameId) {
+          await cdp.send("Target.closeTarget", {
+            targetId: params.targetInfo.targetId,
+          });
+        }
+
+        await cdp.send("Runtime.runIfWaitingForDebugger");
+      });
+
+      void cdp.send("Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: true,
+        flatten: false,
+      });
+
       cdp.send("Page.enable").catch((e) => logger.warn("Page.enable error", e));
 
       cdp.on("Page.windowOpen", async (resp) => {
@@ -456,7 +478,10 @@ class InteractiveBrowser {
     this.shutdownWait = params.shutdownWait * 1000;
 
     if (this.shutdownWait) {
-      this.shutdownTimer = setTimeout(() => process.exit(0), this.shutdownWait);
+      this.shutdownTimer = setTimeout(
+        () => process.exit(ExitCodes.Success),
+        this.shutdownWait,
+      );
       logger.debug(
         `Shutting down in ${this.shutdownWait}ms if no ping received`,
       );
@@ -580,7 +605,7 @@ class InteractiveBrowser {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           clearTimeout(this.shutdownTimer as any);
           this.shutdownTimer = setTimeout(
-            () => process.exit(0),
+            () => process.exit(ExitCodes.Success),
             this.shutdownWait,
           );
           logger.debug(
@@ -660,7 +685,7 @@ class InteractiveBrowser {
           logger.warn("HTTP Error", e);
         }
 
-        setTimeout(() => process.exit(0), 200);
+        setTimeout(() => process.exit(ExitCodes.Success), 200);
         return;
 
       case "/createProfile":
@@ -686,7 +711,7 @@ class InteractiveBrowser {
           logger.warn("HTTP Error", e);
         }
 
-        setTimeout(() => process.exit(0), 200);
+        setTimeout(() => process.exit(ExitCodes.Success), 200);
         return;
     }
 

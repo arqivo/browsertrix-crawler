@@ -3,9 +3,10 @@ import { v4 as uuidv4 } from "uuid";
 
 import { logger } from "./logger.js";
 
-import { MAX_DEPTH } from "./constants.js";
+import { MAX_DEPTH, DEFAULT_MAX_RETRIES } from "./constants.js";
 import { ScopedSeed } from "./seeds.js";
 import { Frame } from "puppeteer-core";
+import { interpolateFilename } from "./storage.js";
 
 // Add declarations
 declare module "ioredis" {
@@ -34,6 +35,15 @@ export enum QueueState {
 }
 
 // ============================================================================
+// treat 0 or 206 as 200 for purposes of dedup
+function normalizeDedupStatus(status: number): number {
+  if (status === 0 || status === 206) {
+    return 200;
+  }
+  return status;
+}
+
+// ============================================================================
 export type WorkerId = number;
 
 // ============================================================================
@@ -45,6 +55,7 @@ export type QueueEntry = {
   extraHops: number;
   ts?: number;
   pageid?: string;
+  retry?: number;
 };
 
 // ============================================================================
@@ -64,6 +75,7 @@ export class PageState {
   seedId: number;
   depth: number;
   extraHops: number;
+  retry: number;
 
   status: number;
 
@@ -82,6 +94,7 @@ export class PageState {
   favicon?: string;
 
   skipBehaviors = false;
+  pageSkipped = false;
   filteredFrames: Frame[] = [];
   loadState: LoadState = LoadState.FAILED;
 
@@ -97,6 +110,7 @@ export class PageState {
     }
     this.pageid = redisData.pageid || uuidv4();
     this.status = 0;
+    this.retry = redisData.retry || 0;
   }
 }
 
@@ -114,6 +128,13 @@ declare module "ioredis" {
       limit: number,
     ): Result<number, Context>;
 
+    trimqueue(
+      qkey: string,
+      pkey: string,
+      skey: string,
+      limit: number,
+    ): Result<number, Context>;
+
     getnext(qkey: string, pkey: string): Result<string, Context>;
 
     markstarted(
@@ -123,14 +144,6 @@ declare module "ioredis" {
       started: string,
       maxPageTime: number,
       uid: string,
-    ): Result<void, Context>;
-
-    movefailed(
-      pkey: string,
-      fkey: string,
-      url: string,
-      value: string,
-      state: string,
     ): Result<void, Context>;
 
     unlockpending(
@@ -144,7 +157,16 @@ declare module "ioredis" {
       qkey: string,
       pkeyUrl: string,
       url: string,
-      maxRetryPending: number,
+      maxRetries: number,
+      maxRegularDepth: number,
+    ): Result<number, Context>;
+
+    requeuefailed(
+      pkey: string,
+      qkey: string,
+      fkey: string,
+      url: string,
+      maxRetries: number,
       maxRegularDepth: number,
     ): Result<number, Context>;
 
@@ -173,7 +195,7 @@ export type SaveState = {
 // ============================================================================
 export class RedisCrawlState {
   redis: Redis;
-  maxRetryPending = 1;
+  maxRetries: number;
 
   uid: string;
   key: string;
@@ -185,28 +207,40 @@ export class RedisCrawlState {
   dkey: string;
   fkey: string;
   ekey: string;
+  bkey: string;
   pageskey: string;
   esKey: string;
   esMap: string;
 
   sitemapDoneKey: string;
 
-  constructor(redis: Redis, key: string, maxPageTime: number, uid: string) {
+  waczFilename: string | null = null;
+
+  constructor(
+    redis: Redis,
+    key: string,
+    maxPageTime: number,
+    uid: string,
+    maxRetries?: number,
+  ) {
     this.redis = redis;
 
     this.uid = uid;
     this.key = key;
     this.maxPageTime = maxPageTime;
+    this.maxRetries = maxRetries ?? DEFAULT_MAX_RETRIES;
 
     this.qkey = this.key + ":q";
     this.pkey = this.key + ":p";
     this.skey = this.key + ":s";
     // done (integer)
     this.dkey = this.key + ":d";
-    // failed
+    // failed final, no more retry
     this.fkey = this.key + ":f";
     // crawler errors
     this.ekey = this.key + ":e";
+    // crawler behavior script messages
+    this.bkey = this.key + ":b";
     // pages
     this.pageskey = this.key + ":pages";
 
@@ -234,6 +268,25 @@ redis.call('zadd', KEYS[2], ARGV[2], ARGV[3]);
 redis.call('hdel', KEYS[1], ARGV[1]);
 return 0;
 `,
+    });
+
+    redis.defineCommand("trimqueue", {
+      numberOfKeys: 3,
+      lua: `
+      local limit = tonumber(ARGV[1]);
+      if redis.call('zcard', KEYS[1]) <= limit then
+        return 0
+      end
+      local res = redis.call('zpopmax', KEYS[1]);
+      local json = res[1];
+
+      if json then
+        local data = cjson.decode(json);
+        redis.call('hdel', KEYS[2], data.url);
+        redis.call('srem', KEYS[3], data.url);
+      end
+      return 1;
+      `,
     });
 
     redis.defineCommand("getnext", {
@@ -279,19 +332,29 @@ end
 `,
     });
 
-    redis.defineCommand("movefailed", {
-      numberOfKeys: 2,
+    redis.defineCommand("requeuefailed", {
+      numberOfKeys: 3,
       lua: `
 local json = redis.call('hget', KEYS[1], ARGV[1]);
 
 if json then
   local data = cjson.decode(json);
-  data[ARGV[3]] = ARGV[2];
-  json = cjson.encode(data);
+  local retry = data['retry'] or 0;
 
-  redis.call('lpush', KEYS[2], json);
   redis.call('hdel', KEYS[1], ARGV[1]);
+
+  if retry < tonumber(ARGV[2]) then
+    retry = retry + 1;
+    data['retry'] = retry;
+    json = cjson.encode(data);
+    local score = (data['depth'] or 0) + ((data['extraHops'] or 0) * ARGV[3]) + (retry * ARGV[3] * 2);
+    redis.call('zadd', KEYS[2], score, json);
+    return retry;
+  else
+    redis.call('lpush', KEYS[3], json);
+  end
 end
+return -1;
 
 `,
     });
@@ -304,11 +367,15 @@ if not res then
   local json = redis.call('hget', KEYS[1], ARGV[1]);
   if json then
     local data = cjson.decode(json);
-    data['retry'] = (data['retry'] or 0) + 1;
+    local retry = data['retry'] or 0;
+
     redis.call('hdel', KEYS[1], ARGV[1]);
-    if tonumber(data['retry']) <= tonumber(ARGV[2]) then
+
+    if retry < tonumber(ARGV[2]) then
+      retry = retry + 1;
+      data['retry'] = retry;
       json = cjson.encode(data);
-      local score = (data['depth'] or 0) + ((data['extraHops'] or 0) * ARGV[3]);
+      local score = (data['depth'] or 0) + ((data['extraHops'] or 0) * ARGV[3]) + (retry * ARGV[3] * 2);
       redis.call('zadd', KEYS[2], score, json);
       return 1;
     else
@@ -363,10 +430,15 @@ return inx;
     return await this.redis.incr(this.dkey);
   }
 
-  async markFailed(url: string) {
-    await this.redis.movefailed(this.pkey, this.fkey, url, "1", "failed");
-
-    return await this.redis.incr(this.dkey);
+  async markFailed(url: string, noRetries = false) {
+    return await this.redis.requeuefailed(
+      this.pkey,
+      this.qkey,
+      this.fkey,
+      url,
+      noRetries ? 0 : this.maxRetries,
+      MAX_DEPTH,
+    );
   }
 
   async markExcluded(url: string) {
@@ -385,12 +457,71 @@ return inx;
     return (await this.queueSize()) == 0 && (await this.numDone()) > 0;
   }
 
+  async trimToLimit(limit: number) {
+    const totalComplete =
+      (await this.numPending()) +
+      (await this.numDone()) +
+      (await this.numFailed());
+    if (!totalComplete) {
+      return;
+    }
+    const remain = Math.max(0, limit - totalComplete);
+    // trim queue until size <= remain
+    while (
+      (await this.redis.trimqueue(this.qkey, this.pkey, this.skey, remain)) ===
+      1
+    ) {
+      /* ignore */
+    }
+  }
+
   async setStatus(status_: string) {
     await this.redis.hset(`${this.key}:status`, this.uid, status_);
   }
 
   async getStatus(): Promise<string> {
     return (await this.redis.hget(`${this.key}:status`, this.uid)) || "";
+  }
+
+  async setWACZFilename(): Promise<string> {
+    const filename = process.env.STORE_FILENAME || "@ts-@id.wacz";
+    this.waczFilename = interpolateFilename(filename, this.key);
+    if (
+      !(await this.redis.hsetnx(
+        `${this.key}:nextWacz`,
+        this.uid,
+        this.waczFilename,
+      ))
+    ) {
+      this.waczFilename = await this.redis.hget(
+        `${this.key}:nextWacz`,
+        this.uid,
+      );
+      logger.debug(
+        "Keeping WACZ Filename",
+        { filename: this.waczFilename },
+        "state",
+      );
+    } else {
+      logger.debug(
+        "Using New WACZ Filename",
+        { filename: this.waczFilename },
+        "state",
+      );
+    }
+    return this.waczFilename!;
+  }
+
+  async getWACZFilename(): Promise<string> {
+    if (!this.waczFilename) {
+      return await this.setWACZFilename();
+    }
+    return this.waczFilename;
+  }
+
+  async clearWACZFilename(): Promise<void> {
+    await this.redis.hdel(`${this.key}:nextWacz`, this.uid);
+    this.waczFilename = null;
   }
 
   async setArchiveSize(size: number) {
@@ -403,6 +534,14 @@ return inx;
     }
 
     if ((await this.redis.hget(`${this.key}:stopone`, this.uid)) === "1") {
+      return true;
+    }
+
+    return false;
+  }
+
+  async isCrawlPaused() {
+    if ((await this.redis.get(`${this.key}:paused`)) === "1") {
       return true;
     }
 
@@ -554,16 +693,17 @@ return inx;
 
   async nextFromQueue() {
     const json = await this._getNext();
+
+    if (!json) {
+      return null;
+    }
+
     let data;
 
     try {
       data = JSON.parse(json);
     } catch (e) {
-      logger.error("Invalid queued json", json, "redis");
-      return null;
-    }
-
-    if (!data) {
+      logger.error("Invalid queued json", json, "state");
       return null;
     }
 
@@ -601,7 +741,11 @@ return inx;
   }
 
   _getScore(data: QueueEntry) {
-    return (data.depth || 0) + (data.extraHops || 0) * MAX_DEPTH;
+    return (
+      (data.depth || 0) +
+      (data.extraHops || 0) * MAX_DEPTH +
+      (data.retry || 0) * MAX_DEPTH * 2
+    );
   }
 
   async _iterSet(key: string, count = 100) {
@@ -759,7 +903,13 @@ return inx;
 
     for (const json of state.failed) {
       const data = JSON.parse(json);
-      await this.redis.zadd(this.qkey, this._getScore(data), json);
+      const retry = data.retry || 0;
+      // allow retrying failed URLs if number of retries has increased
+      if (retry < this.maxRetries) {
+        await this.redis.zadd(this.qkey, this._getScore(data), json);
+      } else {
+        await this.redis.rpush(this.fkey, json);
+      }
       seen.push(data.url);
     }
 
@@ -820,7 +970,7 @@ return inx;
         this.qkey,
         this.pkey + ":" + url,
         url,
-        this.maxRetryPending,
+        this.maxRetries,
         MAX_DEPTH,
       );
       switch (res) {
@@ -840,19 +990,37 @@ return inx;
   }
 
   async addIfNoDupe(key: string, url: string, status: number) {
-    return (await this.redis.sadd(key, status + "|" + url)) === 1;
+    return (
+      (await this.redis.sadd(key, normalizeDedupStatus(status) + "|" + url)) ===
+      1
+    );
   }
 
   async removeDupe(key: string, url: string, status: number) {
-    return await this.redis.srem(key, status + "|" + url);
+    return await this.redis.srem(key, normalizeDedupStatus(status) + "|" + url);
+  }
+
+  async isInUserSet(value: string) {
+    return (await this.redis.sismember(this.key + ":user", value)) === 1;
+  }
+
+  async addToUserSet(value: string) {
+    return (await this.redis.sadd(this.key + ":user", value)) === 1;
   }
 
   async logError(error: string) {
     return await this.redis.lpush(this.ekey, error);
   }
 
-  async writeToPagesQueue(value: string) {
-    return await this.redis.lpush(this.pageskey, value);
+  async logBehavior(behaviorLog: string) {
+    return await this.redis.lpush(this.bkey, behaviorLog);
+  }
+
+  async writeToPagesQueue(
+    data: Record<string, string | number | boolean | object>,
+  ) {
+    data["filename"] = await this.getWACZFilename();
+    return await this.redis.lpush(this.pageskey, JSON.stringify(data));
   }
 
   // add extra seeds from redirect

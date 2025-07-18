@@ -3,6 +3,7 @@
 
 import { Writable } from "node:stream";
 import { RedisCrawlState } from "./state.js";
+import { ExitCodes } from "./constants.js";
 
 // RegExp.prototype.toJSON = RegExp.prototype.toString;
 Object.defineProperty(RegExp.prototype, "toJSON", {
@@ -44,6 +45,7 @@ export const LOG_CONTEXT_TYPES = [
   "blocking",
   "behavior",
   "behaviorScript",
+  "behaviorScriptCustom",
   "jsError",
   "fetch",
   "pageStatus",
@@ -69,11 +71,12 @@ class Logger {
   logStream: Writable | null = null;
   debugLogging = false;
   logErrorsToRedis = false;
+  logBehaviorsToRedis = false;
   logLevels: string[] = [];
   contexts: LogContext[] = [];
   excludeContexts: LogContext[] = [];
   crawlState?: RedisCrawlState | null = null;
-  fatalExitCode = 17;
+  fatalExitCode: ExitCodes = ExitCodes.Fatal;
 
   setDefaultFatalExitCode(exitCode: number) {
     this.fatalExitCode = exitCode;
@@ -89,6 +92,10 @@ class Logger {
 
   setLogErrorsToRedis(logErrorsToRedis: boolean) {
     this.logErrorsToRedis = logErrorsToRedis;
+  }
+
+  setLogBehaviorsToRedis(logBehaviorsToRedis: boolean) {
+    this.logBehaviorsToRedis = logBehaviorsToRedis;
   }
 
   setLogLevel(logLevels: string[]) {
@@ -143,17 +150,34 @@ class Logger {
     };
     const string = JSON.stringify(dataToLog);
     console.log(string);
-    if (this.logStream) {
-      this.logStream.write(string + "\n");
+    try {
+      if (this.logStream) {
+        this.logStream.write(string + "\n");
+      }
+    } catch (e) {
+      //
     }
 
-    const toLogToRedis = ["error", "fatal"];
+    const redisErrorLogLevels = ["error", "fatal"];
     if (
       this.logErrorsToRedis &&
       this.crawlState &&
-      toLogToRedis.includes(logLevel)
+      redisErrorLogLevels.includes(logLevel)
     ) {
       this.crawlState.logError(string).catch(() => {});
+    }
+
+    const redisBehaviorLogLevels = ["info", "warn", "error"];
+    const behaviorContexts = ["behavior", "behaviorScript"];
+    if (
+      this.logBehaviorsToRedis &&
+      this.crawlState &&
+      ((behaviorContexts.includes(context) &&
+        redisBehaviorLogLevels.includes(logLevel)) ||
+        //always include behaviorScriptCustom
+        context === "behaviorScriptCustom")
+    ) {
+      this.crawlState.logBehavior(string).catch(() => {});
     }
   }
 
@@ -179,7 +203,7 @@ class Logger {
     message: string,
     data = {},
     context: LogContext = "general",
-    exitCode = 0,
+    exitCode = ExitCodes.Success,
   ) {
     exitCode = exitCode || this.fatalExitCode;
     this.logAsJSON(`${message}. Quitting`, data, context, "fatal");

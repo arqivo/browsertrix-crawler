@@ -2,11 +2,7 @@ import os from "os";
 
 import { logger, formatErr } from "./logger.js";
 import { sleep, timedRun } from "./timing.js";
-import {
-  DirectFetchRequest,
-  DirectFetchResponse,
-  Recorder,
-} from "./recorder.js";
+import { Recorder } from "./recorder.js";
 import { rxEscape } from "./seeds.js";
 import { CDPSession, Page } from "puppeteer-core";
 import { PageState, WorkerId } from "./state.js";
@@ -18,23 +14,17 @@ const NEW_WINDOW_TIMEOUT = 20;
 const TEARDOWN_TIMEOUT = 10;
 const FINISHED_TIMEOUT = 60;
 
-export type WorkerOpts = {
+export type WorkerState = {
   page: Page;
   cdp: CDPSession;
   workerid: WorkerId;
   // eslint-disable-next-line @typescript-eslint/ban-types
   callbacks: Record<string, Function>;
-  directFetchCapture:
-    | ((request: DirectFetchRequest) => Promise<DirectFetchResponse>)
-    | null;
   recorder: Recorder | null;
   markPageUsed: () => void;
   frameIdToExecId: Map<string, number>;
   isAuthSet?: boolean;
-};
-
-// ===========================================================================
-export type WorkerState = WorkerOpts & {
+  pageBlockUnload?: boolean;
   data: PageState;
 };
 
@@ -53,7 +43,7 @@ export class PageWorker {
   // eslint-disable-next-line @typescript-eslint/ban-types
   callbacks?: Record<string, Function>;
 
-  opts?: WorkerOpts;
+  opts?: WorkerState;
 
   // TODO: Fix this the next time the file is edited.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -135,7 +125,8 @@ export class PageWorker {
     }
   }
 
-  async initPage(url: string): Promise<WorkerOpts> {
+  async initPage(pagestate: PageState): Promise<WorkerState> {
+    const { url } = pagestate;
     let reuse = !this.crashed && !!this.opts && !!this.page;
     if (!this.alwaysReuse) {
       reuse = this.reuseCount <= MAX_REUSE && this.isSameOrigin(url);
@@ -146,6 +137,7 @@ export class PageWorker {
         { reuseCount: this.reuseCount, ...this.logDetails },
         "worker",
       );
+      this.opts!.data = pagestate;
       return this.opts!;
     } else if (this.page) {
       await this.closePage();
@@ -165,6 +157,7 @@ export class PageWorker {
           "New Window Timed Out",
           { workerid },
           "worker",
+          true,
         );
 
         if (!result) {
@@ -176,22 +169,21 @@ export class PageWorker {
         this.page = page;
         this.cdp = cdp;
         this.callbacks = {};
-        const directFetchCapture = this.recorder
-          ? (req: DirectFetchRequest) => this.recorder!.directFetchCapture(req)
-          : null;
+
         this.opts = {
           page,
           cdp,
           workerid,
           callbacks: this.callbacks,
           recorder: this.recorder,
-          directFetchCapture,
           frameIdToExecId: new Map<string, number>(),
           markPageUsed: () => {
             if (!this.alwaysReuse) {
               this.reuseCount++;
             }
           },
+          pageBlockUnload: false,
+          data: pagestate,
         };
 
         if (this.recorder) {
@@ -239,12 +231,15 @@ export class PageWorker {
           break;
         }
 
-        if (retry >= MAX_REUSE) {
-          logger.fatal(
-            "Unable to get new page, browser likely crashed",
-            this.logDetails,
-            "worker",
-          );
+        if (retry >= 2) {
+          if (this.crawler.params.restartsOnError || retry >= 5) {
+            this.crawler.markBrowserCrashed();
+            throw new Error("Unable to load new page, browser needs restart");
+          } else {
+            // see if killing the browser may help, retry a couple more times
+            this.crawler.browser.killBrowser();
+            await sleep(2.0);
+          }
         }
 
         await sleep(0.5);
@@ -356,7 +351,7 @@ export class PageWorker {
     let loggedWaiting = false;
 
     while (await this.crawler.isCrawlRunning()) {
-      await crawlState.processMessage(this.crawler.params.scopedSeeds);
+      await crawlState.processMessage(this.crawler.seeds);
 
       const data = await crawlState.nextFromQueue();
 
@@ -370,10 +365,10 @@ export class PageWorker {
         }
 
         // init page (new or reuse)
-        const opts = await this.initPage(data.url);
+        const opts = await this.initPage(data);
 
         // run timed crawl of page
-        await this.timedCrawlPage({ ...opts, data });
+        await this.timedCrawlPage(opts);
 
         loggedWaiting = false;
       } else {

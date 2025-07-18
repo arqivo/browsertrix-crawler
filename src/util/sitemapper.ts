@@ -10,6 +10,7 @@ import { DETECT_SITEMAP } from "./constants.js";
 import { sleep } from "./timing.js";
 
 import { fetch, Response } from "undici";
+import { getProxyDispatcher } from "./proxy.js";
 
 const SITEMAP_CONCURRENCY = 5;
 
@@ -65,7 +66,10 @@ export class SitemapReader extends EventEmitter {
 
   async _fetchWithRetry(url: string, message: string) {
     while (true) {
-      const resp = await fetch(url, { headers: this.headers });
+      const resp = await fetch(url, {
+        headers: this.headers,
+        dispatcher: getProxyDispatcher(),
+      });
 
       if (resp.ok) {
         return resp;
@@ -300,13 +304,13 @@ export class SitemapReader extends EventEmitter {
         }
       } else if (!otherTags) {
         if (parsingUrl) {
-          console.warn("text in url, ignoring");
+          logger.debug("text in url, ignoring", {}, "sitemap");
         } else if (parsingUrlset) {
-          console.warn("text in urlset, ignoring");
+          logger.debug("text in urlset, ignoring", {}, "sitemap");
         } else if (parsingSitemap) {
-          console.warn("text in sitemap, ignoring");
+          logger.debug("text in sitemap, ignoring", {}, "sitemap");
         } else if (parsingSitemapIndex) {
-          console.warn("text in sitemapindex, ignoring");
+          logger.debug("text in sitemapindex, ignoring", {}, "sitemap");
         }
       }
     };

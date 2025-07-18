@@ -12,7 +12,7 @@ import {
   isRedirectStatus,
 } from "./reqresp.js";
 
-import { fetch, getGlobalDispatcher, Response } from "undici";
+import { fetch, Response } from "undici";
 
 import {
   getCustomRewriter,
@@ -21,12 +21,15 @@ import {
   rewriteHLS,
 } from "@webrecorder/wabac";
 
-import { WARCRecord } from "warcio";
+import { WARCRecord, multiValueHeader } from "warcio";
 import { TempFileBuffer, WARCSerializer } from "warcio/node";
 import { WARCWriter } from "./warcwriter.js";
 import { RedisCrawlState, WorkerId } from "./state.js";
 import { CDPSession, Protocol } from "puppeteer-core";
 import { Crawler } from "../crawler.js";
+import { getProxyDispatcher } from "./proxy.js";
+import { ScopedSeed } from "./seeds.js";
+import EventEmitter from "events";
 
 const MAX_BROWSER_DEFAULT_FETCH_SIZE = 5_000_000;
 const MAX_TEXT_REWRITE_SIZE = 25_000_000;
@@ -42,7 +45,7 @@ const WRITE_DUPE_KEY = "s:writedupe";
 const MIME_EVENT_STREAM = "text/event-stream";
 
 const RW_MIME_TYPES = [
-  "application/x-mpegURL",
+  "application/x-mpegurl",
   "application/vnd.apple.mpegurl",
   "application/dash+xml",
   "text/html",
@@ -119,7 +122,7 @@ export type ResponseStreamAsyncFetchOptions = NetworkLoadAsyncFetchOptions & {
 };
 
 // =================================================================
-export class Recorder {
+export class Recorder extends EventEmitter {
   workerid: WorkerId;
 
   crawler: Crawler;
@@ -149,9 +152,14 @@ export class Recorder {
   writer: WARCWriter;
 
   pageUrl!: string;
+  finalPageUrl = "";
   pageid!: string;
 
+  pageSeed?: ScopedSeed;
+
   frameIdToExecId: Map<string, number> | null;
+
+  shouldSaveStorage = false;
 
   constructor({
     workerid,
@@ -162,9 +170,12 @@ export class Recorder {
     writer: WARCWriter;
     crawler: Crawler;
   }) {
+    super();
     this.workerid = workerid;
     this.crawler = crawler;
     this.crawlState = crawler.crawlState;
+
+    this.shouldSaveStorage = !!crawler.params.saveStorage;
 
     this.writer = writer;
 
@@ -217,7 +228,7 @@ export class Recorder {
 
     // Loading
     cdp.on("Network.loadingFinished", (params) =>
-      this.handleLoadingFinished(params),
+      this.handleLoadingFinished(params, cdp),
     );
 
     cdp.on("Network.loadingFailed", (params) =>
@@ -405,6 +416,10 @@ export class Recorder {
       return;
     }
 
+    if (reqresp.url === this.finalPageUrl) {
+      this.finalPageUrl = reqresp.getRedirectUrl();
+    }
+
     this.serializeToWARC(reqresp).catch((e) =>
       logger.warn("Error Serializing to WARC", e, "recorder"),
     );
@@ -482,7 +497,10 @@ export class Recorder {
     this.removeReqResp(requestId);
   }
 
-  handleLoadingFinished(params: Protocol.Network.LoadingFinishedEvent) {
+  async handleLoadingFinished(
+    params: Protocol.Network.LoadingFinishedEvent,
+    cdp: CDPSession,
+  ) {
     const { requestId } = params;
 
     const reqresp = this.pendingReqResp(requestId, true);
@@ -505,9 +523,38 @@ export class Recorder {
       return;
     }
 
-    this.serializeToWARC(reqresp).catch((e) =>
-      logger.warn("Error Serializing to WARC", e, "recorder"),
-    );
+    if (this.shouldSaveStorage && url === this.finalPageUrl) {
+      await this.saveStorage(reqresp, cdp);
+    }
+
+    try {
+      await this.serializeToWARC(reqresp);
+    } catch (e) {
+      logger.warn("Error Serializing to WARC", e, "recorder");
+    }
+  }
+
+  async saveStorage(reqresp: RequestResponseInfo, cdp: CDPSession) {
+    try {
+      const { url, extraOpts } = reqresp;
+      const securityOrigin = new URL(url).origin;
+
+      const local = await cdp.send("DOMStorage.getDOMStorageItems", {
+        storageId: { securityOrigin, isLocalStorage: true },
+      });
+      const session = await cdp.send("DOMStorage.getDOMStorageItems", {
+        storageId: { securityOrigin, isLocalStorage: false },
+      });
+
+      if (local.entries.length || session.entries.length) {
+        extraOpts.storage = JSON.stringify({
+          local: local.entries,
+          session: session.entries,
+        });
+      }
+    } catch (e) {
+      logger.warn("Error getting local/session storage", e, "recorder");
+    }
   }
 
   async handleRequestPaused(
@@ -540,6 +587,7 @@ export class Recorder {
         !responseErrorReason &&
         !this.shouldSkip(headers, url, method, resourceType)
       ) {
+        this.emit("fetching", { url });
         continued = await this.handleFetchResponse(
           params,
           cdp,
@@ -694,11 +742,27 @@ export class Recorder {
 
     reqresp.fetchContinued = true;
 
+    reqresp.fillFetchRequestPaused(params);
+
     if (
       url === this.pageUrl &&
       (!this.pageInfo.ts ||
-        (responseStatusCode && responseStatusCode < this.pageInfo.tsStatus))
+        (responseStatusCode && responseStatusCode <= this.pageInfo.tsStatus))
     ) {
+      const errorReason = await this.blockPageResponse(
+        url,
+        reqresp,
+        responseHeaders,
+      );
+
+      if (errorReason) {
+        await cdp.send("Fetch.failRequest", {
+          requestId,
+          errorReason,
+        });
+        return true;
+      }
+
       logger.debug("Setting page timestamp", {
         ts: reqresp.ts,
         url,
@@ -708,8 +772,6 @@ export class Recorder {
       this.pageInfo.tsStatus = responseStatusCode!;
       this.mainFrameId = params.frameId;
     }
-
-    reqresp.fillFetchRequestPaused(params);
 
     if (this.noResponseForStatus(responseStatusCode)) {
       reqresp.payload = new Uint8Array();
@@ -787,18 +849,6 @@ export class Recorder {
 
     const rewritten = await this.rewriteResponse(reqresp, mimeType);
 
-    // if in browser context, and not also intercepted in page context
-    // serialize here, as won't be getting a loadingFinished message for it
-    if (
-      isBrowserContext &&
-      !reqresp.inPageContext &&
-      !reqresp.asyncLoading &&
-      reqresp.payload
-    ) {
-      this.removeReqResp(networkId);
-      await this.serializeToWARC(reqresp);
-    }
-
     // not rewritten, and not streaming, return false to continue
     if (!rewritten && !streamingConsume) {
       if (!reqresp.payload) {
@@ -854,6 +904,11 @@ export class Recorder {
   }
 
   addExternalFetch(url: string, cdp: CDPSession) {
+    logger.debug(
+      "Handling fetch from behavior",
+      { url, ...this.logDetails },
+      "recorder",
+    );
     const reqresp = new RequestResponseInfo("0");
     reqresp.url = url;
     reqresp.method = "GET";
@@ -869,9 +924,38 @@ export class Recorder {
     return true;
   }
 
+  async blockPageResponse(
+    url: string,
+    reqresp: RequestResponseInfo,
+    responseHeaders?: Protocol.Fetch.HeaderEntry[],
+  ): Promise<Protocol.Network.ErrorReason | undefined> {
+    if (reqresp.isRedirectStatus()) {
+      try {
+        let loc = this.getLocation(responseHeaders);
+        if (loc) {
+          loc = new URL(loc, url).href;
+
+          if (this.pageSeed && this.pageSeed.isExcluded(loc)) {
+            logger.warn(
+              "Skipping page that redirects to excluded URL",
+              { newUrl: loc, origUrl: this.pageUrl },
+              "recorder",
+            );
+
+            return "BlockedByResponse";
+          }
+        }
+      } catch (e) {
+        // ignore
+        logger.debug("Redirect check error", e, "recorder");
+      }
+    }
+  }
+
   startPage({ pageid, url }: { pageid: string; url: string }) {
     this.pageid = pageid;
     this.pageUrl = url;
+    this.finalPageUrl = this.pageUrl;
     this.logDetails = { page: url, workerid: this.workerid };
     if (this.pendingRequests && this.pendingRequests.size) {
       logger.debug(
@@ -955,7 +1039,7 @@ export class Recorder {
     while (
       numPending &&
       !this.pageFinished &&
-      !this.crawler.interrupted &&
+      !this.crawler.interruptReason &&
       !this.crawler.postCrawling
     ) {
       pending = [];
@@ -1079,11 +1163,13 @@ export class Recorder {
       return false;
     }
 
+    contentType = contentType.toLowerCase();
+
     let newString = null;
     let string = null;
 
     switch (contentType) {
-      case "application/x-mpegURL":
+      case "application/x-mpegurl":
       case "application/vnd.apple.mpegurl":
         string = payload.toString();
         newString = rewriteHLS(string, { save: extraOpts });
@@ -1133,7 +1219,7 @@ export class Recorder {
       return true;
     }
 
-    if (RW_MIME_TYPES.includes(contentType)) {
+    if (RW_MIME_TYPES.includes(contentType.toLowerCase())) {
       return true;
     }
 
@@ -1184,6 +1270,21 @@ export class Recorder {
     for (const header of headers) {
       if (header.name.toLowerCase() === "content-type") {
         return header.value.split(";")[0];
+      }
+    }
+
+    return null;
+  }
+
+  protected getLocation(
+    headers?: Protocol.Fetch.HeaderEntry[] | { name: string; value: string }[],
+  ) {
+    if (!headers) {
+      return null;
+    }
+    for (const header of headers) {
+      if (header.name.toLowerCase() === "location") {
+        return header.value;
       }
     }
 
@@ -1629,14 +1730,18 @@ class AsyncFetcher {
 
     const headers = reqresp.getRequestHeadersDict();
 
-    const dispatcher = getGlobalDispatcher().compose((dispatch) => {
-      return (opts, handler) => {
-        if (opts.headers) {
-          reqresp.requestHeaders = opts.headers as Record<string, string>;
-        }
-        return dispatch(opts, handler);
-      };
-    });
+    let dispatcher = getProxyDispatcher();
+
+    if (dispatcher) {
+      dispatcher = dispatcher.compose((dispatch) => {
+        return (opts, handler) => {
+          if (opts.headers) {
+            reqresp.requestHeaders = opts.headers as Record<string, string>;
+          }
+          return dispatch(opts, handler);
+        };
+      });
+    }
 
     const resp = await fetch(url!, {
       method,
@@ -1848,7 +1953,7 @@ function createResponse(
 
   const url = reqresp.url;
   const warcVersion = "WARC/1.1";
-  const statusline = `HTTP/1.1 ${reqresp.status} ${reqresp.statusText}`;
+  const statusline = `${reqresp.httpProtocol} ${reqresp.status} ${reqresp.statusText}`;
   const date = new Date(reqresp.ts).toISOString();
 
   if (!reqresp.payload) {
@@ -1860,6 +1965,13 @@ function createResponse(
   const warcHeaders: Record<string, string> = {
     "WARC-Page-ID": pageid,
   };
+
+  if (reqresp.protocols.length) {
+    warcHeaders["WARC-Protocol"] = multiValueHeader(
+      "WARC-Protocol",
+      reqresp.protocols,
+    );
+  }
 
   if (reqresp.resourceType) {
     warcHeaders["WARC-Resource-Type"] = reqresp.resourceType;
@@ -1900,7 +2012,9 @@ function createRequest(
 
   const urlParsed = new URL(url);
 
-  const statusline = `${method} ${url.slice(urlParsed.origin.length)} HTTP/1.1`;
+  const statusline = `${method} ${url.slice(urlParsed.origin.length)} ${
+    reqresp.httpProtocol
+  }`;
 
   const requestBody = reqresp.postData
     ? [encoder.encode(reqresp.postData)]

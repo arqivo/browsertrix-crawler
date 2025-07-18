@@ -1,5 +1,5 @@
 import net from "net";
-import { Agent, Dispatcher, ProxyAgent, setGlobalDispatcher } from "undici";
+import { Agent, Dispatcher, ProxyAgent } from "undici";
 
 import child_process from "child_process";
 
@@ -7,11 +7,13 @@ import { logger } from "./logger.js";
 
 import { socksDispatcher } from "fetch-socks";
 import type { SocksProxyType } from "socks/typings/common/constants.js";
-import { FETCH_HEADERS_TIMEOUT_SECS } from "./constants.js";
+import { ExitCodes, FETCH_HEADERS_TIMEOUT_SECS } from "./constants.js";
 
 const SSH_PROXY_LOCAL_PORT = 9722;
 
 const SSH_WAIT_TIMEOUT = 30000;
+
+let proxyDispatcher: Dispatcher | undefined = undefined;
 
 export function getEnvProxyUrl() {
   if (process.env.PROXY_SERVER) {
@@ -24,6 +26,31 @@ export function getEnvProxyUrl() {
   }
 
   return "";
+}
+
+export function getSafeProxyString(proxyString: string): string {
+  if (!proxyString) {
+    return "";
+  }
+
+  try {
+    const proxySplit = proxyString.split("://");
+    const prefix = proxySplit[0];
+    const remainder = proxySplit[1];
+
+    const credSplit = remainder.split("@");
+
+    let addressIndex = 1;
+    if (credSplit.length === 1) {
+      addressIndex = 0;
+    }
+
+    const addressNoCredentials = credSplit[addressIndex];
+
+    return `${prefix}://${addressNoCredentials}`;
+  } catch (e) {
+    return "";
+  }
 }
 
 export async function initProxy(
@@ -46,8 +73,12 @@ export async function initProxy(
 
   // set global fetch() dispatcher (with proxy, if any)
   const dispatcher = createDispatcher(proxy, agentOpts);
-  setGlobalDispatcher(dispatcher);
+  proxyDispatcher = dispatcher;
   return proxy;
+}
+
+export function getProxyDispatcher() {
+  return proxyDispatcher;
 }
 
 export function createDispatcher(
@@ -188,7 +219,7 @@ export async function runSSHD(params: Record<string, any>, detached: boolean) {
         code: proc.exitCode,
       },
       "proxy",
-      21,
+      ExitCodes.ProxyError,
     );
     return;
   }

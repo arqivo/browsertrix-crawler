@@ -4,6 +4,8 @@ import { logger } from "./util/logger.js";
 import { setExitOnRedisError } from "./util/redis.js";
 import { Crawler } from "./crawler.js";
 import { ReplayCrawler } from "./replaycrawler.js";
+import fs from "node:fs";
+import { ExitCodes, InterruptReason } from "./util/constants.js";
 
 let crawler: Crawler | null = null;
 
@@ -14,12 +16,12 @@ async function handleTerminate(signame: string) {
   logger.info(`${signame} received...`);
   if (!crawler || !crawler.crawlState) {
     logger.error("error: no crawler running, exiting");
-    process.exit(1);
+    process.exit(ExitCodes.GenericError);
   }
 
   if (crawler.done) {
     logger.info("success: crawler done, exiting");
-    process.exit(0);
+    process.exit(ExitCodes.Success);
   }
 
   setExitOnRedisError();
@@ -27,9 +29,9 @@ async function handleTerminate(signame: string) {
   try {
     await crawler.checkCanceled();
 
-    if (!crawler.interrupted) {
-      logger.info("SIGNAL: gracefully finishing current pages...");
-      crawler.gracefulFinishOnInterrupt();
+    if (!crawler.interruptReason) {
+      logger.info("SIGNAL: interrupt request received...");
+      crawler.gracefulFinishOnInterrupt(InterruptReason.SignalInterrupted);
     } else if (forceTerm || Date.now() - lastSigInt > 200) {
       logger.info("SIGNAL: stopping crawl now...");
       await crawler.serializeAndExit();
@@ -54,6 +56,13 @@ if (process.argv[1].endsWith("qa")) {
   crawler = new ReplayCrawler();
 } else {
   crawler = new Crawler();
+}
+
+// remove any core dumps which could be taking up space in the working dir
+try {
+  fs.unlinkSync("./core");
+} catch (e) {
+  //ignore
 }
 
 await crawler.run();
