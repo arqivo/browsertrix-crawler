@@ -18,15 +18,17 @@ export function timedRun(
   // return Promise return value or log error if timeout is reached first
   const timeout = seconds * 1000;
 
+  let tm: NodeJS.Timeout;
+
   const rejectPromiseOnTimeout = (timeout: number) => {
     return new Promise((resolve, reject) => {
-      setTimeout(() => reject("timeout reached"), timeout);
+      tm = setTimeout(() => reject("timeout reached"), timeout);
     });
   };
 
-  return Promise.race([promise, rejectPromiseOnTimeout(timeout)]).catch(
-    (err) => {
-      if (err == "timeout reached") {
+  return Promise.race([promise, rejectPromiseOnTimeout(timeout)])
+    .catch((err) => {
+      if (err === "timeout reached") {
         const logFunc = isWarn ? logger.warn : logger.error;
         logFunc.call(
           logger,
@@ -38,8 +40,8 @@ export function timedRun(
         //logger.error("Unknown exception", {...errJSON(err), ...logDetails}, context);
         throw err;
       }
-    },
-  );
+    })
+    .finally(() => clearTimeout(tm));
 }
 
 export function secondsElapsed(startTime: number, nowDate: Date | null = null) {

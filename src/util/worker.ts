@@ -2,7 +2,11 @@ import os from "os";
 
 import { logger, formatErr } from "./logger.js";
 import { sleep, timedRun } from "./timing.js";
-import { Recorder } from "./recorder.js";
+import {
+  DirectFetchRequest,
+  DirectFetchResponse,
+  Recorder,
+} from "./recorder.js";
 import { rxEscape } from "./seeds.js";
 import { CDPSession, Page } from "puppeteer-core";
 import { PageState, WorkerId } from "./state.js";
@@ -20,10 +24,13 @@ export type WorkerOpts = {
   workerid: WorkerId;
   // eslint-disable-next-line @typescript-eslint/ban-types
   callbacks: Record<string, Function>;
-  directFetchCapture?:
-    | ((url: string) => Promise<{ fetched: boolean; mime: string }>)
+  directFetchCapture:
+    | ((request: DirectFetchRequest) => Promise<DirectFetchResponse>)
     | null;
+  recorder: Recorder | null;
+  markPageUsed: () => void;
   frameIdToExecId: Map<string, number>;
+  isAuthSet?: boolean;
 };
 
 // ===========================================================================
@@ -131,7 +138,6 @@ export class PageWorker {
   async initPage(url: string): Promise<WorkerOpts> {
     let reuse = !this.crashed && !!this.opts && !!this.page;
     if (!this.alwaysReuse) {
-      ++this.reuseCount;
       reuse = this.reuseCount <= MAX_REUSE && this.isSameOrigin(url);
     }
     if (reuse) {
@@ -171,15 +177,21 @@ export class PageWorker {
         this.cdp = cdp;
         this.callbacks = {};
         const directFetchCapture = this.recorder
-          ? (x: string) => this.recorder!.directFetchCapture(x)
+          ? (req: DirectFetchRequest) => this.recorder!.directFetchCapture(req)
           : null;
         this.opts = {
           page,
           cdp,
           workerid,
           callbacks: this.callbacks,
+          recorder: this.recorder,
           directFetchCapture,
           frameIdToExecId: new Map<string, number>(),
+          markPageUsed: () => {
+            if (!this.alwaysReuse) {
+              this.reuseCount++;
+            }
+          },
         };
 
         if (this.recorder) {
@@ -276,6 +288,7 @@ export class PageWorker {
           "Page Worker Timeout",
           this.logDetails,
           "worker",
+          true,
         ),
         this.crashBreak,
       ]);
@@ -350,7 +363,7 @@ export class PageWorker {
       // see if any work data in the queue
       if (data) {
         // filter out any out-of-scope pages right away
-        if (!this.crawler.isInScope(data, this.logDetails)) {
+        if (!(await this.crawler.isInScope(data, this.logDetails))) {
           logger.info("Page no longer in scope", data);
           await crawlState.markExcluded(data.url);
           continue;
@@ -366,7 +379,7 @@ export class PageWorker {
       } else {
         // indicate that the worker has no more work (mostly for screencasting, status, etc...)
         // depending on other works, will either get more work or crawl will end
-        this.crawler.workerIdle(this.id);
+        await this.crawler.workerIdle(this.id);
 
         // check if any pending urls
         const pending = await crawlState.numPending();
@@ -427,9 +440,9 @@ export async function runWorkers(
 
   await Promise.allSettled(workers.map((worker) => worker.run()));
 
-  await crawler.browser.close();
-
   await closeWorkers();
+
+  await crawler.browser.close();
 }
 
 // ===========================================================================

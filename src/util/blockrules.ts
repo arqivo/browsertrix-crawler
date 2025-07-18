@@ -4,6 +4,8 @@ import { logger, formatErr } from "./logger.js";
 import { HTTPRequest, Page } from "puppeteer-core";
 import { Browser } from "./browser.js";
 
+import { fetch } from "undici";
+
 const RULE_TYPES = ["block", "allowOnly"];
 
 const ALWAYS_ALLOW = ["https://pywb.proxy/", "http://pywb.proxy/"];
@@ -16,7 +18,7 @@ const BlockState = {
   BLOCK_AD: "advertisement",
 };
 
-type BlockRuleDecl = {
+export type BlockRuleDecl = {
   url?: string;
   frameTextMatch?: string;
   inFrameUrl?: string;
@@ -102,7 +104,7 @@ export class BlockRules {
         );
       }
     };
-    await browser.interceptRequest(page, onRequest);
+    browser.interceptRequest(page, onRequest);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

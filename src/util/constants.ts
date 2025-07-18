@@ -24,12 +24,26 @@ export const EXTRACT_TEXT_TYPES = ["to-pages", "to-warc", "final-to-warc"];
 
 export const BEHAVIOR_LOG_FUNC = "__bx_log";
 export const ADD_LINK_FUNC = "__bx_addLink";
+export const FETCH_FUNC = "__bx_fetch";
+
 export const MAX_DEPTH = 1000000;
 
-export const DEFAULT_SELECTORS = [
+export const FETCH_HEADERS_TIMEOUT_SECS = 30;
+export const PAGE_OP_TIMEOUT_SECS = 5;
+export const SITEMAP_INITIAL_FETCH_TIMEOUT_SECS = 30;
+
+export type ExtractSelector = {
+  selector: string;
+  extract: string;
+  isAttribute: boolean;
+};
+
+export const DEFAULT_SELECTORS: ExtractSelector[] = [
   {
     selector: "a[href]",
     extract: "href",
     isAttribute: false,
   },
 ];
+
+export const DISPLAY = ":99";

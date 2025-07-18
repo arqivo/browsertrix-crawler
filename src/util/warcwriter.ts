@@ -2,7 +2,7 @@ import fs from "fs";
 import { Writable } from "stream";
 import path from "path";
 
-import { CDXIndexer, WARCRecord } from "warcio";
+import { CDXIndexer, WARCRecord, DEFAULT_CDX_FIELDS } from "warcio";
 import { WARCSerializer } from "warcio/node";
 import { logger, formatErr, LogDetails, LogContext } from "./logger.js";
 import type { IndexerOffsetLength } from "warcio";
@@ -10,6 +10,8 @@ import { timestampNow } from "./timing.js";
 import PQueue from "p-queue";
 
 const DEFAULT_ROLLOVER_SIZE = 1_000_000_000;
+
+let warcInfo = {};
 
 export type ResourceRecordData = {
   buffer: Uint8Array;
@@ -22,7 +24,7 @@ export type ResourceRecordData = {
 // =================================================================
 export class WARCWriter implements IndexerOffsetLength {
   archivesDir: string;
-  tempCdxDir?: string;
+  warcCdxDir?: string;
   filenameTemplate: string;
   filename?: string;
   gzip: boolean;
@@ -43,23 +45,21 @@ export class WARCWriter implements IndexerOffsetLength {
 
   constructor({
     archivesDir,
-    tempCdxDir,
+    warcCdxDir,
     filenameTemplate,
     rolloverSize = DEFAULT_ROLLOVER_SIZE,
     gzip,
     logDetails,
   }: {
     archivesDir: string;
-    tempCdxDir?: string;
+    warcCdxDir?: string;
     filenameTemplate: string;
     rolloverSize?: number;
     gzip: boolean;
     logDetails: Record<string, string>;
   }) {
     this.archivesDir = archivesDir;
-    this.tempCdxDir = tempCdxDir;
-    // for now, disabling CDX
-    this.tempCdxDir = undefined;
+    this.warcCdxDir = warcCdxDir;
     this.logDetails = logDetails;
     this.gzip = gzip;
     this.rolloverSize = rolloverSize;
@@ -75,8 +75,11 @@ export class WARCWriter implements IndexerOffsetLength {
     this.offset = 0;
     this.recordLength = 0;
 
-    if (this.tempCdxDir) {
-      this.indexer = new CDXIndexer({ format: "cdxj" });
+    if (this.warcCdxDir) {
+      this.indexer = new CDXIndexer({
+        format: "cdxj",
+        fields: [...DEFAULT_CDX_FIELDS, "req.http:cookie", "referrer"],
+      });
     }
 
     return filename;
@@ -110,12 +113,19 @@ export class WARCWriter implements IndexerOffsetLength {
         flags: "a",
       });
     }
-    if (!this.cdxFH && this.tempCdxDir) {
+    if (!this.cdxFH && this.warcCdxDir) {
       this.cdxFH = fs.createWriteStream(
-        path.join(this.tempCdxDir, this.filename + ".cdx"),
+        path.join(this.warcCdxDir, this.filename + ".cdx"),
         { flags: "a" },
       );
     }
+
+    const buffer = await createWARCInfo(this.filename);
+    fh.write(buffer);
+
+    // account for size of warcinfo record, (don't index as warcinfo never added to cdx)
+    this.recordLength = buffer.length;
+    this.offset += buffer.length;
 
     return fh;
   }
@@ -148,6 +158,10 @@ export class WARCWriter implements IndexerOffsetLength {
 
     this._writeCDX(responseRecord);
 
+    if (requestRecord.httpHeaders?.method !== "GET") {
+      await requestRecord.readFully(false);
+    }
+
     const requestSerializer = new WARCSerializer(requestRecord, opts);
     this.recordLength = await this._writeRecord(
       requestRecord,
@@ -155,6 +169,10 @@ export class WARCWriter implements IndexerOffsetLength {
     );
 
     this._writeCDX(requestRecord);
+
+    if (this.offset >= this.rolloverSize) {
+      this.fh = await this.initFH();
+    }
   }
 
   private addToQueue(
@@ -162,7 +180,7 @@ export class WARCWriter implements IndexerOffsetLength {
     details: LogDetails | null = null,
     logContext: LogContext = "writer",
   ) {
-    this.warcQ.add(async () => {
+    void this.warcQ.add(async () => {
       try {
         await func();
         if (details) {
@@ -190,6 +208,10 @@ export class WARCWriter implements IndexerOffsetLength {
     this.recordLength = await this._writeRecord(record, requestSerializer);
 
     this._writeCDX(record);
+
+    if (this.offset >= this.rolloverSize) {
+      this.fh = await this.initFH();
+    }
   }
 
   writeNewResourceRecord(
@@ -250,7 +272,7 @@ export class WARCWriter implements IndexerOffsetLength {
     let total = 0;
     const url = record.warcTargetURI;
 
-    if (!this.fh || this.offset >= this.rolloverSize) {
+    if (!this.fh) {
       this.fh = await this.initFH();
     }
 
@@ -308,6 +330,33 @@ export class WARCWriter implements IndexerOffsetLength {
 
     this.done = true;
   }
+}
+
+// =================================================================
+export function setWARCInfo(
+  software: string,
+  otherParams?: Record<string, string>,
+) {
+  warcInfo = {
+    software,
+    format: "WARC File Format 1.1",
+    ...otherParams,
+  };
+}
+
+// =================================================================
+export async function createWARCInfo(filename: string) {
+  const warcVersion = "WARC/1.1";
+  const type = "warcinfo";
+
+  const record = WARCRecord.createWARCInfo(
+    { filename, type, warcVersion },
+    warcInfo,
+  );
+  const buffer = await WARCSerializer.serialize(record, {
+    gzip: true,
+  });
+  return buffer;
 }
 
 // =================================================================

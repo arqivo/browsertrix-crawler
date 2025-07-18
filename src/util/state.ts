@@ -76,7 +76,7 @@ export class PageState {
 
   callbacks: PageCallbacks = {};
 
-  isHTMLPage?: boolean;
+  isHTMLPage = true;
   text?: string;
   screenshotView?: Buffer;
   favicon?: string;
@@ -147,11 +147,19 @@ declare module "ioredis" {
       maxRetryPending: number,
       maxRegularDepth: number,
     ): Result<number, Context>;
+
+    addnewseed(
+      esKey: string,
+      esMap: string,
+      skey: string,
+      url: string,
+      seedData: string,
+    ): Result<number, Context>;
   }
 }
 
 // ============================================================================
-type SaveState = {
+export type SaveState = {
   done?: number | string[];
   finished: string[];
   queued: string[];
@@ -179,6 +187,7 @@ export class RedisCrawlState {
   ekey: string;
   pageskey: string;
   esKey: string;
+  esMap: string;
 
   sitemapDoneKey: string;
 
@@ -202,6 +211,7 @@ export class RedisCrawlState {
     this.pageskey = this.key + ":pages";
 
     this.esKey = this.key + ":extraSeeds";
+    this.esMap = this.key + ":esMap";
 
     this.sitemapDoneKey = this.key + ":sitemapDone";
 
@@ -309,6 +319,21 @@ end
 return 0;
 `,
     });
+
+    redis.defineCommand("addnewseed", {
+      numberOfKeys: 3,
+      lua: `
+local res = redis.call('hget', KEYS[2], ARGV[2]);
+if res then
+    return tonumber(res);
+end
+
+local inx = redis.call('lpush', KEYS[1], ARGV[1]) - 1;
+redis.call('hset', KEYS[2], ARGV[2], tostring(inx));
+redis.call('sadd', KEYS[3], ARGV[2]);
+return inx;
+`,
+    });
   }
 
   async _getNext() {
@@ -414,7 +439,9 @@ return 0;
             // can happen async w/o slowing down crawling
             // each page is still checked if in scope before crawling, even while
             // queue is being filtered
-            this.filterQueue(regex);
+            this.filterQueue(regex).catch((e) =>
+              logger.warn("filtering queue error", e, "exclusion"),
+            );
             break;
 
           case "removeExclusion":
@@ -662,9 +689,11 @@ return 0;
     }
 
     if (state.extraSeeds) {
+      const origLen = seeds.length;
+
       for (const extraSeed of state.extraSeeds) {
         const { newUrl, origSeedId }: ExtraRedirectSeed = JSON.parse(extraSeed);
-        await this.addExtraSeed(seeds, origSeedId, newUrl);
+        await this.addExtraSeed(seeds, origLen, origSeedId, newUrl);
       }
     }
 
@@ -680,8 +709,20 @@ return 0;
       seen.push(data.url);
     }
 
-    for (const json of state.pending) {
-      const data = JSON.parse(json);
+    for (let json of state.pending) {
+      let data;
+
+      // if the data is string, parse
+      if (typeof json === "string") {
+        data = JSON.parse(json);
+        // otherwise, use as is, set json to json version
+      } else if (typeof json === "object") {
+        data = json;
+        json = JSON.stringify(data);
+      } else {
+        continue;
+      }
+
       if (checkScope) {
         if (!this.recheckScope(data, seeds)) {
           continue;
@@ -751,8 +792,7 @@ return 0;
   }
 
   async getPendingList() {
-    const list = await this.redis.hvals(this.pkey);
-    return list.map((x) => JSON.parse(x));
+    return await this.redis.hvals(this.pkey);
   }
 
   async getErrorList() {
@@ -799,12 +839,12 @@ return 0;
     return await this.redis.zcard(this.qkey);
   }
 
-  async addIfNoDupe(key: string, value: string) {
-    return (await this.redis.sadd(key, value)) === 1;
+  async addIfNoDupe(key: string, url: string, status: number) {
+    return (await this.redis.sadd(key, status + "|" + url)) === 1;
   }
 
-  async removeDupe(key: string, value: string) {
-    return await this.redis.srem(key, value);
+  async removeDupe(key: string, url: string, status: number) {
+    return await this.redis.srem(key, status + "|" + url);
   }
 
   async logError(error: string) {
@@ -816,7 +856,12 @@ return 0;
   }
 
   // add extra seeds from redirect
-  async addExtraSeed(seeds: ScopedSeed[], origSeedId: number, newUrl: string) {
+  async addExtraSeed(
+    seeds: ScopedSeed[],
+    origLength: number,
+    origSeedId: number,
+    newUrl: string,
+  ) {
     if (!seeds[origSeedId]) {
       logger.fatal(
         "State load, original seed missing",
@@ -824,12 +869,43 @@ return 0;
         "state",
       );
     }
-    seeds.push(seeds[origSeedId].newScopedSeed(newUrl));
-    const newSeedId = seeds.length - 1;
     const redirectSeed: ExtraRedirectSeed = { origSeedId, newUrl };
-    await this.redis.sadd(this.skey, newUrl);
-    await this.redis.lpush(this.esKey, JSON.stringify(redirectSeed));
+    const seedData = JSON.stringify(redirectSeed);
+    const newSeedId =
+      origLength +
+      (await this.redis.addnewseed(
+        this.esKey,
+        this.esMap,
+        this.skey,
+        seedData,
+        newUrl,
+      ));
+    seeds[newSeedId] = seeds[origSeedId].newScopedSeed(newUrl);
+
+    //const newSeedId = seeds.length - 1;
+    //await this.redis.sadd(this.skey, newUrl);
+    //await this.redis.lpush(this.esKey, JSON.stringify(redirectSeed));
     return newSeedId;
+  }
+
+  async getSeedAt(seeds: ScopedSeed[], origLength: number, newSeedId: number) {
+    if (seeds[newSeedId]) {
+      return seeds[newSeedId];
+    }
+
+    const newSeedDataList = await this.redis.lrange(
+      this.esKey,
+      newSeedId - origLength,
+      newSeedId - origLength,
+    );
+    if (newSeedDataList.length) {
+      const { origSeedId, newUrl } = JSON.parse(
+        newSeedDataList[0],
+      ) as ExtraRedirectSeed;
+      seeds[newSeedId] = seeds[origSeedId].newScopedSeed(newUrl);
+    }
+
+    return seeds[newSeedId];
   }
 
   async getExtraSeeds() {

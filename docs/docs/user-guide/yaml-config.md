@@ -46,3 +46,19 @@ seeds:
     depth: 1
     scopeType: "prefix"
 ```
+
+## HTTP Auth
+
+!!! warning "HTTP basic auth credentials are written to the archive"
+    We recommend exercising caution and only archiving with dedicated archival accounts, changing your password or deleting the account when finished.
+
+Browsertrix Crawler supports [HTTP Basic Auth](https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication), which can be provide on a per-seed basis as part of the URL, for example:
+`--url https://username:password@example.com/`.
+
+Alternatively, credentials can be added to the `auth` field for each seed:
+
+```yaml
+seeds:
+  - url: https://example.com/
+    auth: username:password
+```

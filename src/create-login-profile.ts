@@ -7,7 +7,7 @@ import http, { IncomingMessage, ServerResponse } from "http";
 import readline from "readline";
 import child_process from "child_process";
 
-import yargs, { Options } from "yargs";
+import yargs from "yargs";
 
 import { logger } from "./util/logger.js";
 
@@ -15,6 +15,8 @@ import { Browser } from "./util/browser.js";
 import { initStorage } from "./util/storage.js";
 import { CDPSession, Page, PuppeteerLifeCycleEvent } from "puppeteer-core";
 import { getInfoString } from "./util/file_reader.js";
+import { DISPLAY } from "./util/constants.js";
+import { initProxy } from "./util/proxy.js";
 
 const profileHTML = fs.readFileSync(
   new URL("../html/createProfile.html", import.meta.url),
@@ -33,84 +35,106 @@ const behaviors = fs.readFileSync(
   { encoding: "utf8" },
 );
 
-function cliOpts(): { [key: string]: Options } {
-  return {
-    url: {
-      describe: "The URL of the login page",
-      type: "string",
-      demandOption: true,
-    },
+function initArgs() {
+  return yargs(process.argv)
+    .usage("browsertrix-crawler profile [options]")
+    .options({
+      url: {
+        describe: "The URL of the login page",
+        type: "string",
+        demandOption: true,
+      },
 
-    user: {
-      describe:
-        "The username for the login. If not specified, will be prompted",
-    },
+      user: {
+        describe:
+          "The username for the login. If not specified, will be prompted",
+        type: "string",
+      },
 
-    password: {
-      describe:
-        "The password for the login. If not specified, will be prompted (recommended)",
-    },
+      password: {
+        describe:
+          "The password for the login. If not specified, will be prompted (recommended)",
+        type: "string",
+      },
 
-    filename: {
-      describe:
-        "The filename for the profile tarball, stored within /crawls/profiles if absolute path not provided",
-      default: "/crawls/profiles/profile.tar.gz",
-    },
+      filename: {
+        describe:
+          "The filename for the profile tarball, stored within /crawls/profiles if absolute path not provided",
+        type: "string",
+        default: "/crawls/profiles/profile.tar.gz",
+      },
 
-    debugScreenshot: {
-      describe:
-        "If specified, take a screenshot after login and save as this filename",
-    },
+      debugScreenshot: {
+        describe:
+          "If specified, take a screenshot after login and save as this filename",
+        type: "boolean",
+        default: false,
+      },
 
-    headless: {
-      describe: "Run in headless mode, otherwise start xvfb",
-      type: "boolean",
-      default: false,
-    },
+      headless: {
+        describe: "Run in headless mode, otherwise start xvfb",
+        type: "boolean",
+        default: false,
+      },
 
-    automated: {
-      describe: "Start in automated mode, no interactive browser",
-      type: "boolean",
-      default: false,
-    },
+      automated: {
+        describe: "Start in automated mode, no interactive browser",
+        type: "boolean",
+        default: false,
+      },
 
-    interactive: {
-      describe: "Deprecated. Now the default option!",
-      type: "boolean",
-      default: false,
-    },
+      interactive: {
+        describe: "Deprecated. Now the default option!",
+        type: "boolean",
+        default: false,
+      },
 
-    shutdownWait: {
-      describe:
-        "Shutdown browser in interactive after this many seconds, if no pings received",
-      type: "number",
-      default: 0,
-    },
+      shutdownWait: {
+        describe:
+          "Shutdown browser in interactive after this many seconds, if no pings received",
+        type: "number",
+        default: 0,
+      },
 
-    profile: {
-      describe:
-        "Path to tar.gz file which will be extracted and used as the browser profile",
-      type: "string",
-    },
+      profile: {
+        describe:
+          "Path or HTTP(S) URL to tar.gz file which contains the browser profile directory",
+        type: "string",
+        default: "",
+      },
 
-    windowSize: {
-      type: "string",
-      describe: "Browser window dimensions, specified as: width,height",
-      default: getDefaultWindowSize(),
-    },
+      windowSize: {
+        describe: "Browser window dimensions, specified as: width,height",
+        type: "string",
+        default: getDefaultWindowSize(),
+      },
 
-    proxy: {
-      type: "boolean",
-      default: false,
-    },
+      cookieDays: {
+        describe:
+          "If >0, set all cookies, including session cookies, to have this duration in days before saving profile",
+        type: "number",
+        default: 7,
+      },
 
-    cookieDays: {
-      type: "number",
-      describe:
-        "If >0, set all cookies, including session cookies, to have this duration in days before saving profile",
-      default: 7,
-    },
-  };
+      proxyServer: {
+        describe:
+          "if set, will use specified proxy server. Takes precedence over any env var proxy settings",
+        type: "string",
+      },
+
+      sshProxyPrivateKeyFile: {
+        describe:
+          "path to SSH private key for SOCKS5 over SSH proxy connection",
+        type: "string",
+      },
+
+      sshProxyKnownHostsFile: {
+        describe:
+          "path to SSH known hosts file for SOCKS5 over SSH proxy connection",
+        type: "string",
+      },
+    })
+    .parseSync();
 }
 
 function getDefaultWindowSize() {
@@ -126,10 +150,7 @@ function handleTerminate(signame: string) {
 }
 
 async function main() {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const params: any = yargs(process.argv)
-    .usage("browsertrix-crawler profile [options]")
-    .option(cliOpts()).argv;
+  const params = initArgs();
 
   logger.setDebugLogging(true);
 
@@ -139,10 +160,12 @@ async function main() {
 
   process.on("SIGTERM", () => handleTerminate("SIGTERM"));
 
+  const proxyServer = await initProxy(params, false);
+
   if (!params.headless) {
     logger.debug("Launching XVFB");
     child_process.spawn("Xvfb", [
-      process.env.DISPLAY || "",
+      DISPLAY,
       "-listen",
       "tcp",
       "-screen",
@@ -168,7 +191,7 @@ async function main() {
       "-passwd",
       process.env.VNC_PASS || "",
       "-display",
-      process.env.DISPLAY || "",
+      DISPLAY,
     ]);
   }
 
@@ -179,7 +202,7 @@ async function main() {
     headless: params.headless,
     signals: false,
     chromeOptions: {
-      proxy: false,
+      proxy: proxyServer,
       extraArgs: [
         "--window-position=0,0",
         `--window-size=${params.windowSize}`,
@@ -228,7 +251,14 @@ async function main() {
     const target = await cdp.send("Target.getTargetInfo");
     const targetId = target.targetInfo.targetId;
 
-    new InteractiveBrowser(params, browser, page, cdp, targetId, waitUntil);
+    const ibrowser = new InteractiveBrowser(
+      params,
+      browser,
+      page,
+      cdp,
+      targetId,
+    );
+    await ibrowser.startLoad(waitUntil);
   } else {
     await automatedProfile(params, browser, page, cdp, waitUntil);
   }
@@ -247,16 +277,20 @@ async function automatedProfile(
 
   logger.info(`Loading page: ${params.url}`);
 
-  await page.goto(params.url, { waitUntil });
+  try {
+    await page.goto(params.url, { waitUntil });
+  } catch (e) {
+    logger.error("Page Load Failed/Interrupted", e);
+  }
 
   logger.debug("Looking for username and password entry fields on page...");
 
   try {
     u = await page.waitForSelector(
-      "//input[contains(@name, 'user') or contains(@name, 'email')]",
+      "input[name='user'],input[name='username'],input[name='email']",
     );
     p = await page.waitForSelector(
-      "//input[contains(@name, 'pass') and @type='password']",
+      "input[type='password'].input[name='pass'],input[name='password']",
     );
   } catch (e) {
     if (params.debugScreenshot) {
@@ -380,13 +414,15 @@ class InteractiveBrowser {
     page: Page,
     cdp: CDPSession,
     targetId: string,
-    waitUntil: PuppeteerLifeCycleEvent = "load",
   ) {
     logger.info("Creating Profile Interactively...");
-    child_process.spawn("socat", [
-      "tcp-listen:9222,reuseaddr,fork",
-      "tcp:localhost:9221",
-    ]);
+
+    if (params.headless) {
+      child_process.spawn("socat", [
+        "tcp-listen:9222,reuseaddr,fork",
+        "tcp:localhost:9221",
+      ]);
+    }
 
     this.params = params;
     this.browser = browser;
@@ -401,12 +437,18 @@ class InteractiveBrowser {
 
     // attempt to keep everything to initial tab if headless
     if (this.params.headless) {
-      cdp.send("Page.enable");
+      cdp.send("Page.enable").catch((e) => logger.warn("Page.enable error", e));
 
       cdp.on("Page.windowOpen", async (resp) => {
-        if (resp.url) {
+        if (!resp.url) {
+          return;
+        }
+
+        try {
           await cdp.send("Target.activateTarget", { targetId: this.targetId });
           await page.goto(resp.url);
+        } catch (e) {
+          logger.error("Page Load Failed/Interrupted", e);
         }
       });
     }
@@ -436,17 +478,24 @@ class InteractiveBrowser {
     } else {
       logger.info("Screencasting with CDP on port 9222");
     }
+  }
 
-    logger.info(`Loading page: ${params.url}`);
+  async startLoad(waitUntil: PuppeteerLifeCycleEvent = "load") {
+    logger.info(`Loading page: ${this.params.url}`);
 
-    page.goto(params.url, { waitUntil, timeout: 0 }).finally(() => {
+    try {
+      await this.page.goto(this.params.url, { waitUntil, timeout: 0 });
       logger.info("Loaded!");
-    });
+    } catch (e) {
+      logger.warn("Page Load Failed/Interrupted", e);
+    }
   }
 
   handlePageLoad() {
     this.addOrigin();
-    this.saveCookiesFor(this.page.url());
+    this.saveCookiesFor(this.page.url()).catch((e) =>
+      logger.warn("Error saving cookies", e),
+    );
   }
 
   async saveAllCookies() {
@@ -568,7 +617,12 @@ class InteractiveBrowser {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true }));
 
-          this.page.goto(url);
+          logger.info("Loading Page", { page: url });
+
+          this.page
+            .goto(url)
+            .catch((e) => logger.warn("Page Load Failed/Interrupted", e));
+
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } catch (e: any) {
           res.writeHead(400, { "Content-Type": "application/json" });
@@ -670,4 +724,4 @@ class InteractiveBrowser {
   }
 }
 
-main();
+await main();

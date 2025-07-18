@@ -2,6 +2,8 @@ import { HTTPRequest, Page } from "puppeteer-core";
 import { formatErr, logger } from "./logger.js";
 import { Browser } from "./browser.js";
 
+import { fetch } from "undici";
+
 export class OriginOverride {
   originOverride: { origUrl: URL; destUrl: URL }[];
 
@@ -32,7 +34,7 @@ export class OriginOverride {
         }
 
         if (!newUrl || !orig) {
-          request.continue({}, -1);
+          await request.continue({}, -1);
           return;
         }
 
@@ -55,16 +57,16 @@ export class OriginOverride {
           "originOverride",
         );
 
-        request.respond({ body, headers: respHeaders, status }, -1);
+        await request.respond({ body, headers: respHeaders, status }, -1);
       } catch (e) {
         logger.warn(
           "Error overriding origin",
           { ...formatErr(e), url: page.url() },
           "originOverride",
         );
-        request.continue({}, -1);
+        await request.continue({}, -1);
       }
     };
-    await browser.interceptRequest(page, onRequest);
+    browser.interceptRequest(page, onRequest);
   }
 }

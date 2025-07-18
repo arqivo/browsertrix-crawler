@@ -6,15 +6,17 @@ import util from "util";
 import os from "os";
 import { createHash } from "crypto";
 
-import crc32 from "crc/crc32";
-
 import * as Minio from "minio";
 
 import { initRedis } from "./redis.js";
 import { logger } from "./logger.js";
 
-// @ts-expect-error TODO fill in why error is expected
+// @ts-expect-error (incorrect types on get-folder-size)
 import getFolderSize from "get-folder-size";
+
+import { WACZ } from "./wacz.js";
+
+const DEFAULT_REGION = "us-east-1";
 
 // ===========================================================================
 export class S3StorageSync {
@@ -58,6 +60,8 @@ export class S3StorageSync {
       this.fullPrefix = url.href;
     }
 
+    const region = process.env.STORE_REGION || DEFAULT_REGION;
+
     this.client = new Minio.Client({
       endPoint: url.hostname,
       port: Number(url.port) || (url.protocol === "https:" ? 443 : 80),
@@ -65,7 +69,7 @@ export class S3StorageSync {
       accessKey,
       secretKey,
       partSize: 100 * 1024 * 1024,
-      region: "auto",
+      region,
     });
 
     this.bucketName = url.pathname.slice(1).split("/")[0];
@@ -77,6 +81,32 @@ export class S3StorageSync {
     this.userId = userId;
     this.crawlId = crawlId;
     this.webhookUrl = webhookUrl;
+  }
+
+  async uploadStreamingWACZ(wacz: WACZ, targetFilename: string) {
+    const fileUploadInfo = {
+      bucket: this.bucketName,
+      crawlId: this.crawlId,
+      prefix: this.objectPrefix,
+      targetFilename,
+    };
+    logger.info("S3 file upload information", fileUploadInfo, "storage");
+
+    const waczStream = wacz.generate();
+
+    await this.client.putObject(
+      this.bucketName,
+      this.objectPrefix + targetFilename,
+      waczStream,
+    );
+
+    const hash = wacz.getHash();
+    const path = targetFilename;
+
+    const size = wacz.getSize();
+
+    // for backwards compatibility, keep 'bytes'
+    return { path, size, hash, bytes: size };
   }
 
   async uploadFile(srcFilename: string, targetFilename: string) {
@@ -94,13 +124,13 @@ export class S3StorageSync {
       srcFilename,
     );
 
-    const { hash, crc32 } = await checksumFile("sha256", srcFilename);
+    const hash = await checksumFile("sha256", srcFilename);
     const path = targetFilename;
 
     const size = await getFileSize(srcFilename);
 
     // for backwards compatibility, keep 'bytes'
-    return { path, size, hash, crc32, bytes: size };
+    return { path, size, hash, bytes: size };
   }
 
   async downloadFile(srcFilename: string, destFilename: string) {
@@ -112,11 +142,15 @@ export class S3StorageSync {
   }
 
   async uploadCollWACZ(
-    srcFilename: string,
+    srcOrWACZ: string | WACZ,
     targetFilename: string,
     completed = true,
   ) {
-    const resource = await this.uploadFile(srcFilename, targetFilename);
+    const resource =
+      typeof srcOrWACZ === "string"
+        ? await this.uploadFile(srcOrWACZ, targetFilename)
+        : await this.uploadStreamingWACZ(srcOrWACZ, targetFilename);
+
     logger.info(
       "WACZ S3 file upload resource",
       { targetFilename, resource },
@@ -189,7 +223,7 @@ export async function getFileSize(filename: string) {
   return stats.size;
 }
 
-export async function getDirSize(dir: string) {
+export async function getDirSize(dir: string): Promise<number> {
   const { size, errors } = await getFolderSize(dir);
   if (errors && errors.length) {
     logger.warn("Size check errors", { errors }, "storage");
@@ -198,23 +232,27 @@ export async function getDirSize(dir: string) {
 }
 
 export async function checkDiskUtilization(
+  collDir: string,
   // TODO: Fix this the next time the file is edited.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   params: Record<string, any>,
   archiveDirSize: number,
   dfOutput = null,
+  doLog = true,
 ) {
   const diskUsage: Record<string, string> = await getDiskUsage(
-    "/crawls",
+    collDir,
     dfOutput,
   );
   const usedPercentage = parseInt(diskUsage["Use%"].slice(0, -1));
 
   // Check that disk usage isn't already above threshold
   if (usedPercentage >= params.diskUtilization) {
-    logger.info(
-      `Disk utilization threshold reached ${usedPercentage}% > ${params.diskUtilization}%, stopping`,
-    );
+    if (doLog) {
+      logger.info(
+        `Disk utilization threshold reached ${usedPercentage}% > ${params.diskUtilization}%, stopping`,
+      );
+    }
     return {
       stop: true,
       used: usedPercentage,
@@ -228,10 +266,15 @@ export async function checkDiskUtilization(
   const kbTotal = parseInt(diskUsage["1K-blocks"]);
 
   let kbArchiveDirSize = Math.round(archiveDirSize / 1024);
-  if (params.combineWARC && params.generateWACZ) {
-    kbArchiveDirSize *= 4;
-  } else if (params.combineWARC || params.generateWACZ) {
-    kbArchiveDirSize *= 2;
+
+  // assume if has STORE_ENDPOINT_URL, will be uploading to remote
+  // and not storing local copy of either WACZ or WARC
+  if (!process.env.STORE_ENDPOINT_URL) {
+    if (params.combineWARC && params.generateWACZ) {
+      kbArchiveDirSize *= 4;
+    } else if (params.combineWARC || params.generateWACZ) {
+      kbArchiveDirSize *= 2;
+    }
   }
 
   const projectedTotal = kbUsed + kbArchiveDirSize;
@@ -241,9 +284,11 @@ export async function checkDiskUtilization(
   );
 
   if (projectedUsedPercentage >= params.diskUtilization) {
-    logger.info(
-      `Disk utilization projected to reach threshold ${projectedUsedPercentage}% > ${params.diskUtilization}%, stopping`,
-    );
+    if (doLog) {
+      logger.info(
+        `Disk utilization projected to reach threshold ${projectedUsedPercentage}% > ${params.diskUtilization}%, stopping`,
+      );
+    }
     return {
       stop: true,
       used: usedPercentage,
@@ -286,21 +331,16 @@ export function calculatePercentageUsed(used: number, total: number) {
   return Math.round((used / total) * 100);
 }
 
-function checksumFile(
-  hashName: string,
-  path: string,
-): Promise<{ hash: string; crc32: number }> {
+function checksumFile(hashName: string, path: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = createHash(hashName);
-    let crc: number = 0;
 
     const stream = fs.createReadStream(path);
     stream.on("error", (err) => reject(err));
     stream.on("data", (chunk) => {
       hash.update(chunk);
-      crc = crc32(chunk, crc);
     });
-    stream.on("end", () => resolve({ hash: hash.digest("hex"), crc32: crc }));
+    stream.on("end", () => resolve(hash.digest("hex")));
   });
 }
 

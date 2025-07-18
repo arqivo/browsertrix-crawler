@@ -9,6 +9,8 @@ import { logger, formatErr } from "./logger.js";
 import { DETECT_SITEMAP } from "./constants.js";
 import { sleep } from "./timing.js";
 
+import { fetch, Response } from "undici";
+
 const SITEMAP_CONCURRENCY = 5;
 
 const TEXT_CONTENT_TYPE = ["text/plain"];
@@ -146,7 +148,7 @@ export class SitemapReader extends EventEmitter {
       // if specific URL provided, check if its a .xml file or a robots.txt file
       fullUrl = new URL(sitemap, seedUrl).href;
       let expected = null;
-      if (fullUrl.endsWith(".xml")) {
+      if (fullUrl.endsWith(".xml") || fullUrl.endsWith(".xml.gz")) {
         expected = XML_CONTENT_TYPES;
         isSitemap = true;
       } else if (fullUrl.endsWith(".txt")) {
@@ -185,7 +187,7 @@ export class SitemapReader extends EventEmitter {
         { fullUrl, seedUrl },
         "sitemap",
       );
-      await this._parseSitemapFromResponse(fullUrl, resp);
+      this._parseSitemapFromResponse(fullUrl, resp);
     }
   }
 
@@ -212,25 +214,33 @@ export class SitemapReader extends EventEmitter {
 
   async parseSitemap(url: string) {
     this.seenSitemapSet.add(url);
+    this.pending.add(url);
 
     const resp = await this._fetchWithRetry(url, "Sitemap parse failed");
     if (!resp) {
       return;
     }
-    await this._parseSitemapFromResponse(url, resp);
+
+    this._parseSitemapFromResponse(url, resp);
   }
 
-  private async _parseSitemapFromResponse(url: string, resp: Response) {
+  private _parseSitemapFromResponse(url: string, resp: Response) {
     let stream;
 
     const { body } = resp;
     if (!body) {
+      void this.closeSitemap(url);
       throw new Error("missing response body");
     }
     // decompress .gz sitemaps
-    if (url.endsWith(".gz")) {
+    // if content-encoding is gzip, then likely already being decompressed by fetch api
+    if (
+      url.endsWith(".gz") &&
+      resp.headers.get("content-encoding") !== "gzip"
+    ) {
       const ds = new DecompressionStream("gzip");
-      stream = body.pipeThrough(ds);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      stream = body.pipeThrough(ds as any);
     } else {
       stream = body;
     }
@@ -238,7 +248,21 @@ export class SitemapReader extends EventEmitter {
     const readableNodeStream = Readable.fromWeb(
       stream as ReadableStream<Uint8Array>,
     );
+
+    readableNodeStream.on("error", (e: Error) => {
+      logger.warn("Error parsing sitemap", formatErr(e), "sitemap");
+      void this.closeSitemap(url);
+    });
+
     this.initSaxParser(url, readableNodeStream);
+  }
+
+  private async closeSitemap(url: string) {
+    this.pending.delete(url);
+    if (!this.pending.size) {
+      await this.queue.onIdle();
+      this.emit("end");
+    }
   }
 
   initSaxParser(url: string, sourceStream: Readable) {
@@ -265,13 +289,29 @@ export class SitemapReader extends EventEmitter {
 
     let otherTags = 0;
 
-    parserStream.on("end", async () => {
-      this.pending.delete(url);
-      if (!this.pending.size) {
-        await this.queue.onIdle();
-        this.emit("end");
+    const processText = (text: string) => {
+      if (parsingLoc) {
+        currUrl = text;
+      } else if (parsingLastmod) {
+        try {
+          lastmod = new Date(text);
+        } catch (e) {
+          lastmod = null;
+        }
+      } else if (!otherTags) {
+        if (parsingUrl) {
+          console.warn("text in url, ignoring");
+        } else if (parsingUrlset) {
+          console.warn("text in urlset, ignoring");
+        } else if (parsingSitemap) {
+          console.warn("text in sitemap, ignoring");
+        } else if (parsingSitemapIndex) {
+          console.warn("text in sitemapindex, ignoring");
+        }
       }
-    });
+    };
+
+    parserStream.on("end", () => this.closeSitemap(url));
 
     parserStream.on("opentag", (node: sax.Tag) => {
       switch (node.name) {
@@ -350,27 +390,8 @@ export class SitemapReader extends EventEmitter {
       }
     });
 
-    parserStream.on("text", (text: string) => {
-      if (parsingLoc) {
-        currUrl = text;
-      } else if (parsingLastmod) {
-        try {
-          lastmod = new Date(text);
-        } catch (e) {
-          lastmod = null;
-        }
-      } else if (!otherTags) {
-        if (parsingUrl) {
-          console.warn("text in url, ignoring");
-        } else if (parsingUrlset) {
-          console.warn("text in urlset, ignoring");
-        } else if (parsingSitemap) {
-          console.warn("text in sitemap, ignoring");
-        } else if (parsingSitemapIndex) {
-          console.warn("text in sitemapindex, ignoring");
-        }
-      }
-    });
+    parserStream.on("text", (text: string) => processText(text));
+    parserStream.on("cdata", (text: string) => processText(text));
 
     parserStream.on("error", (err: Error) => {
       if (this.atLimit()) {
@@ -428,7 +449,7 @@ export class SitemapReader extends EventEmitter {
       return;
     }
 
-    this.queue.add(async () => {
+    void this.queue.add(async () => {
       try {
         await this.parseSitemap(url);
       } catch (e) {

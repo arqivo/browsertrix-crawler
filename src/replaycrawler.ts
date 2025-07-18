@@ -10,10 +10,7 @@ import { PageInfoRecord, PageInfoValue, Recorder } from "./util/recorder.js";
 import fsp from "fs/promises";
 import path from "path";
 
-// @ts-expect-error wabac.js
-import { ZipRangeReader } from "@webrecorder/wabac/src/wacz/ziprangereader.js";
-// @ts-expect-error wabac.js
-import { createLoader } from "@webrecorder/wabac/src/blockloaders.js";
+import { ZipRangeReader, createLoader } from "@webrecorder/wabac";
 
 import { AsyncIterReader } from "warcio";
 import { parseArgs } from "./util/argParser.js";
@@ -110,8 +107,8 @@ export class ReplayCrawler extends Crawler {
 
     this.infoWriter = null;
 
-    this.includeRx = parseRx(this.params.include);
-    this.excludeRx = parseRx(this.params.include);
+    this.includeRx = parseRx(this.params.scopeIncludeRx);
+    this.excludeRx = parseRx(this.params.scopeExcludeRx);
   }
 
   async bootstrap(): Promise<void> {
@@ -166,7 +163,7 @@ export class ReplayCrawler extends Crawler {
     await this.loadPages(this.qaSource);
   }
 
-  isInScope() {
+  async isInScope() {
     return true;
   }
 
@@ -256,7 +253,7 @@ export class ReplayCrawler extends Crawler {
     }
 
     for (const s of this.excludeRx) {
-      if (!s.test(url)) {
+      if (s.test(url)) {
         logger.info("Skipping excluded page", { url }, "replay");
         return;
       }
@@ -330,10 +327,10 @@ export class ReplayCrawler extends Crawler {
           page.frames().length > 1
         ) {
           const frame = page.frames()[1];
-          const timeoutid = setTimeout(() => {
+          const timeoutid = setTimeout(async () => {
             logger.warn("Reloading RWP Frame, not inited", { url }, "replay");
             try {
-              frame.evaluate("window.location.reload();");
+              await frame.evaluate("window.location.reload();");
             } catch (e) {
               logger.error("RWP Reload failed", e, "replay");
             }
@@ -397,6 +394,8 @@ export class ReplayCrawler extends Crawler {
       return;
     }
 
+    opts.markPageUsed();
+
     const date = new Date(ts);
 
     const timestamp = date.toISOString().slice(0, 19).replace(/[T:-]/g, "");
@@ -412,6 +411,7 @@ export class ReplayCrawler extends Crawler {
       ts: date,
       comparison: { resourceCounts: {} },
       counts: { jsErrors: 0 },
+      tsStatus: 999,
     };
     this.pageInfos.set(page, pageInfo);
 
@@ -456,6 +456,8 @@ export class ReplayCrawler extends Crawler {
     data.favicon = await this.getFavicon(page, {});
 
     await this.doPostLoadActions(opts, true);
+
+    await this.awaitPageExtraDelay(opts);
 
     await this.compareScreenshots(page, data, url, date, workerid);
 
@@ -574,7 +576,11 @@ export class ReplayCrawler extends Crawler {
 
     const dist = levenshtein(origText, replayText);
     const maxLen = Math.max(origText.length, replayText.length);
-    const matchPercent = (maxLen - dist) / maxLen;
+
+    let matchPercent = 1.0;
+    if (maxLen > 0) {
+      matchPercent = (maxLen - dist) / maxLen;
+    }
     logger.info("Levenshtein Dist", { url, dist, matchPercent, maxLen });
 
     const pageInfo = this.pageInfos.get(page);
@@ -774,7 +780,7 @@ export class ReplayCrawler extends Crawler {
 
 class WACZLoader {
   url: string;
-  zipreader: ZipRangeReader;
+  zipreader: ZipRangeReader | null;
 
   constructor(url: string) {
     this.url = url;
@@ -793,7 +799,7 @@ class WACZLoader {
   }
 
   async loadFile(fileInZip: string) {
-    const { reader } = await this.zipreader.loadFile(fileInZip);
+    const { reader } = await this.zipreader!.loadFile(fileInZip);
 
     if (!reader) {
       return null;

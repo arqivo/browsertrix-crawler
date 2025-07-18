@@ -20,7 +20,7 @@ export function formatErr(e: unknown): Record<string, any> {
   } else if (typeof e === "object") {
     return e || {};
   } else {
-    return { message: (e as object).toString() };
+    return { message: (e as object) + "" };
   }
 }
 
@@ -51,7 +51,9 @@ export const LOG_CONTEXT_TYPES = [
   "crawlStatus",
   "links",
   "sitemap",
+  "wacz",
   "replay",
+  "proxy",
 ] as const;
 
 export type LogContext = (typeof LOG_CONTEXT_TYPES)[number];
@@ -151,7 +153,7 @@ class Logger {
       this.crawlState &&
       toLogToRedis.includes(logLevel)
     ) {
-      this.crawlState.logError(string);
+      this.crawlState.logError(string).catch(() => {});
     }
   }
 
@@ -183,7 +185,10 @@ class Logger {
     this.logAsJSON(`${message}. Quitting`, data, context, "fatal");
 
     if (this.crawlState) {
-      this.crawlState.setStatus("failed").finally(process.exit(exitCode));
+      this.crawlState
+        .setStatus("failed")
+        .catch(() => {})
+        .finally(process.exit(exitCode));
     } else {
       process.exit(exitCode);
     }

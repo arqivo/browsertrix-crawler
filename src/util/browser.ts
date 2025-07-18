@@ -6,10 +6,10 @@ import { Readable } from "node:stream";
 import os from "os";
 import path from "path";
 
-import { LogContext, logger } from "./logger.js";
+import { formatErr, LogContext, logger } from "./logger.js";
 import { initStorage } from "./storage.js";
 
-import type { ServiceWorkerOpt } from "./constants.js";
+import { DISPLAY, type ServiceWorkerOpt } from "./constants.js";
 
 import puppeteer, {
   Frame,
@@ -22,7 +22,7 @@ import { CDPSession, Target, Browser as PptrBrowser } from "puppeteer-core";
 import { Recorder } from "./recorder.js";
 
 type BtrixChromeOpts = {
-  proxy?: boolean;
+  proxy?: string;
   userAgent?: string | null;
   extraArgs?: string[];
 };
@@ -41,6 +41,10 @@ type LaunchOpts = {
 
   recording: boolean;
 };
+
+// fixed height of the browser UI (may need to be adjusted in the future)
+// todo: a way to determine this?
+const BROWSER_HEIGHT_OFFSET = 81;
 
 // ==================================================================
 export class Browser {
@@ -89,12 +93,19 @@ export class Browser {
       args.push("--disable-site-isolation-trials");
     }
 
+    if (!headless) {
+      args.push(`--display=${DISPLAY}`);
+    }
+
     let defaultViewport = null;
 
     if (process.env.GEOMETRY) {
       const geom = process.env.GEOMETRY.split("x");
 
-      defaultViewport = { width: Number(geom[0]), height: Number(geom[1]) };
+      defaultViewport = {
+        width: Number(geom[0]),
+        height: Number(geom[1]) - (recording ? 0 : BROWSER_HEIGHT_OFFSET),
+      };
     }
 
     const launchOpts: PuppeteerLaunchOptions = {
@@ -102,7 +113,7 @@ export class Browser {
       headless,
       executablePath: this.getBrowserExe(),
       ignoreDefaultArgs: ["--enable-automation", "--hide-scrollbars"],
-      ignoreHTTPSErrors: true,
+      acceptInsecureCerts: true,
       handleSIGHUP: signals,
       handleSIGINT: signals,
       handleSIGTERM: signals,
@@ -115,8 +126,7 @@ export class Browser {
         ? undefined
         : (target) => this.targetFilter(target),
     };
-
-    await this._init(launchOpts, ondisconnect, recording);
+    await this._init(launchOpts, ondisconnect);
   }
 
   targetFilter(target: Target) {
@@ -130,11 +140,6 @@ export class Browser {
   }
 
   async setupPage({ page }: { page: Page; cdp: CDPSession }) {
-    await this.addInitScript(
-      page,
-      'Object.defineProperty(navigator, "webdriver", {value: false});',
-    );
-
     switch (this.swOpt) {
       case "disabled":
         logger.debug("Service Workers: always disabled", {}, "browser");
@@ -217,7 +222,7 @@ export class Browser {
   }
 
   chromeArgs({
-    proxy = true,
+    proxy = "",
     userAgent = null,
     extraArgs = [],
   }: BtrixChromeOpts) {
@@ -237,10 +242,12 @@ export class Browser {
     ];
 
     if (proxy) {
+      logger.info("Using proxy", { proxy }, "browser");
+    }
+
+    if (proxy) {
       args.push("--ignore-certificate-errors");
-      args.push(
-        `--proxy-server=http://${process.env.PROXY_HOST}:${process.env.PROXY_PORT}`,
-      );
+      args.push(`--proxy-server=${proxy}`);
     }
 
     return args;
@@ -364,8 +371,8 @@ export class Browser {
     }
   }
 
-  addInitScript(page: Page, script: string) {
-    return page.evaluateOnNewDocument(script);
+  async addInitScript(page: Page, script: string) {
+    await page.evaluateOnNewDocument(script);
   }
 
   async checkScript(cdp: CDPSession, filename: string, script: string) {
@@ -385,7 +392,6 @@ export class Browser {
     launchOpts: PuppeteerLaunchOptions,
     // eslint-disable-next-line @typescript-eslint/ban-types
     ondisconnect: Function | null = null,
-    recording: boolean,
   ) {
     this.browser = await puppeteer.launch(launchOpts);
 
@@ -393,9 +399,7 @@ export class Browser {
 
     this.firstCDP = await target.createCDPSession();
 
-    if (recording) {
-      await this.serviceWorkerFetch();
-    }
+    await this.browserContextFetch();
 
     if (ondisconnect) {
       this.browser.on("disconnected", (err) => ondisconnect(err));
@@ -403,6 +407,21 @@ export class Browser {
     this.browser.on("disconnected", () => {
       this.browser = null;
     });
+
+    // common permissions
+    const permissions = [
+      "notifications",
+      "geolocation",
+      "camera",
+      "microphone",
+    ];
+
+    for (const name of permissions) {
+      await this.firstCDP.send("Browser.setPermission", {
+        permission: { name },
+        setting: "granted",
+      });
+    }
   }
 
   async newWindowPageWithCDP(): Promise<{ cdp: CDPSession; page: Page }> {
@@ -472,57 +491,46 @@ export class Browser {
     return { page, cdp };
   }
 
-  async serviceWorkerFetch() {
+  async browserContextFetch() {
     if (!this.firstCDP) {
       return;
     }
 
     this.firstCDP.on("Fetch.requestPaused", async (params) => {
-      const { frameId, requestId, networkId, request } = params;
+      const { frameId, requestId, request } = params;
+
+      const { url } = request;
 
       if (!this.firstCDP) {
         throw new Error("CDP missing");
       }
 
-      if (networkId) {
-        try {
-          await this.firstCDP.send("Fetch.continueResponse", { requestId });
-        } catch (e) {
-          logger.warn(
-            "continueResponse failed",
-            { url: request.url },
-            "recorder",
-          );
-        }
-        return;
-      }
-
       let foundRecorder = null;
 
       for (const recorder of this.recorders) {
-        if (recorder.swUrls.has(request.url)) {
+        if (recorder.swUrls.has(url)) {
           recorder.swFrameIds.add(frameId);
         }
 
-        if (recorder.swFrameIds && recorder.swFrameIds.has(frameId)) {
+        if (recorder.hasFrame(frameId)) {
           foundRecorder = recorder;
           break;
         }
       }
 
       if (!foundRecorder) {
-        logger.debug(
+        logger.warn(
           "Skipping URL from unknown frame",
-          { url: request.url, frameId },
+          { url, frameId },
           "recorder",
         );
 
         try {
           await this.firstCDP.send("Fetch.continueResponse", { requestId });
         } catch (e) {
-          logger.warn(
+          logger.debug(
             "continueResponse failed",
-            { url: request.url },
+            { url, ...formatErr(e), from: "serviceWorker" },
             "recorder",
           );
         }
@@ -589,6 +597,7 @@ export const defaultArgs = [
   "--disable-prompt-on-repost",
   "--disable-renderer-backgrounding",
   "--disable-sync",
+  "--disable-lazy-loading",
   "--force-color-profile=srgb",
   "--metrics-recording-only",
   "--no-first-run",
