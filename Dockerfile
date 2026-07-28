@@ -1,3 +1,14 @@
+# Arqivo fork build/push:
+#
+#   Production (amd64, ECR):
+#     docker buildx build --platform linux/amd64 -f Dockerfile -t arqivo-browsertrix-crawler .
+#     docker tag arqivo-browsertrix-crawler:latest 851725346735.dkr.ecr.eu-central-1.amazonaws.com/arqivo-browsertrix-crawler:1.14.0
+#     aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 851725346735.dkr.ecr.eu-central-1.amazonaws.com
+#     docker push 851725346735.dkr.ecr.eu-central-1.amazonaws.com/arqivo-browsertrix-crawler:1.14.0
+#
+#   Local dev (arm64), the tag HarvestService::browsertrixImageOptions() expects:
+#     docker buildx build --platform linux/arm64 -f Dockerfile -t arqivo-browsertrix-crawler-1.14.0 .
+#
 ARG BROWSER_VERSION=1.91.175
 ARG BROWSER_IMAGE_BASE=webrecorder/browsertrix-browser-base:brave-${BROWSER_VERSION}
 
@@ -73,7 +84,9 @@ RUN mkdir -p /app/behaviors
 
 WORKDIR /crawls
 
-# enable to test custom behaviors build (from browsertrix-behaviors)
+# To test a custom behaviors build, drop a bundle here and uncomment:
+# (the arqivo fork used to ship a pinned 0.9.0 bundle this way; 1.14 depends on
+#  browsertrix-behaviors ^0.12.2 directly, so the pin would be a downgrade)
 # COPY behaviors.js /app/node_modules/browsertrix-behaviors/dist/behaviors.js
 
 # add brave/chromium group policies

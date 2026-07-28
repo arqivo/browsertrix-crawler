@@ -74,6 +74,7 @@ import { WARCWriter, createWARCInfo, setWARCInfo } from "./util/warcwriter.js";
 import { isHTMLMime, isRedirectStatus } from "./util/reqresp.js";
 import { initProxy } from "./util/proxy.js";
 import { initFlow, nextFlowStep } from "./util/flowbehavior.js";
+import { Actions } from "./actions/index.js";
 import { isDisallowedByRobots, setRobotsConfig } from "./util/robots.js";
 import { request } from "undici";
 
@@ -1357,7 +1358,11 @@ self.__bx_behaviors.selectMainBehavior();
 
     data.loadState = LoadState.EXTRACTION_DONE;
 
-    if (this.params.behaviorOpts && data.status < 400) {
+    if (
+      this.params.behaviorOpts &&
+      data.status < 400 &&
+      this.params.enableJavascript
+    ) {
       if (data.skipBehaviors) {
         logger.warn("Skipping behaviors for slow page", logDetails, "behavior");
       } else {
@@ -1409,6 +1414,10 @@ self.__bx_behaviors.selectMainBehavior();
         }
       }
     }
+
+    // Per-site post-load action (src/actions/), used where a site needs
+    // page-level intervention the behavior system cannot express.
+    await Actions.runPostLoad(url, page, logger, logDetails, this, data);
   }
 
   async awaitPageExtraDelay(opts: WorkerState) {
@@ -1456,6 +1465,8 @@ self.__bx_behaviors.selectMainBehavior();
 
       await this.crawlState.markFinished(url);
 
+      await this.crawlState.logUrlFinish(url, data.status, data.retry);
+
       if (this.healthChecker) {
         this.healthChecker.resetErrors();
       }
@@ -1496,6 +1507,8 @@ self.__bx_behaviors.selectMainBehavior();
 
         if (retry < 0) {
           await this.writePage(data);
+
+          await this.crawlState.logUrlFinish(url, data.status || 0, data.retry);
 
           await this.serializeConfig();
 

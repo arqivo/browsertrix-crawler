@@ -283,6 +283,14 @@ class Logger {
 
       if (this.crawlState && status) {
         await this.crawlState.setStatus(status);
+
+        // The redis instance is shared per task and its RDB dump is carried
+        // forward to the next crawl in the chain, so this crawl's keys must
+        // not accumulate there. Dedupe keys live under a different prefix and
+        // are deliberately left alone — see cleanupRedis().
+        if (status === "done") {
+          await this.crawlState.cleanupRedis();
+        }
       }
     } catch (e) {
       this.error("Error shutting down, exiting anyway", e);

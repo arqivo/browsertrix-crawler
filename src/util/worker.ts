@@ -271,6 +271,9 @@ export class PageWorker {
       this.recorder.startPage({ pageid, url, state: data });
     }
 
+    // Live progress: the runner reads this while the crawl is still running.
+    await this.crawler.crawlState.logUrlStart(url, data.retry);
+
     try {
       await Promise.race([
         timedRun(
@@ -295,7 +298,7 @@ export class PageWorker {
       await this.closePage();
     } finally {
       try {
-        if (this.recorder) {
+        if (this.recorder && this.crawler.params.writePageInfo) {
           opts.data.ts = this.recorder.writePageInfoRecord();
         }
       } catch (e) {

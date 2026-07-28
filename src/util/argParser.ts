@@ -83,6 +83,23 @@ class ArgParser {
           default: [],
         },
 
+        writePageInfo: {
+          describe:
+            "If false, do not write urn:pageinfo: records to the WARC. They are " +
+            "the live side of harvest verification, so leaving this on is the " +
+            "normal case.",
+          type: "boolean",
+          default: true,
+        },
+
+        enableJavascript: {
+          describe:
+            "Enable javascript in the browser while crawling. When false, " +
+            "behaviors are skipped too — they have nothing to drive.",
+          type: "boolean",
+          default: true,
+        },
+
         seedFile: {
           alias: ["urlFile"],
           describe:

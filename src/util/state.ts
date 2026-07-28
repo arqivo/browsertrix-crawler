@@ -163,6 +163,11 @@ declare module "ioredis" {
 
     getnext(qkey: string, pkey: string): Result<string, Context>;
 
+    deleteWithPrefix(
+      key: string,
+      callback?: Callback<string>,
+    ): Result<string, Context>;
+
     markstarted(
       pkey: string,
       pkeyUrl: string,
@@ -850,6 +855,9 @@ export class RedisCrawlState extends RedisDedupeIndex {
   esKey: string;
   esMap: string;
 
+  urlLogKey: string;
+  urlLogOrderKey: string;
+
   exKey: string;
 
   sitemapDoneKey: string;
@@ -902,6 +910,12 @@ export class RedisCrawlState extends RedisDedupeIndex {
 
     this.esKey = this.crawlId + ":extraSeeds";
     this.esMap = this.crawlId + ":esMap";
+
+    // Per-URL start/finish log. Read by the runner's CrawlPageTracker to show
+    // live progress while a crawl runs — the crawler's own pages.jsonl only
+    // lands at the end.
+    this.urlLogKey = this.crawlId + ":urllog";
+    this.urlLogOrderKey = this.crawlId + ":urllog:order";
 
     // stores URLs that have been seen but excluded
     // (eg. redirect-to-excluded or trimmed)
@@ -1981,5 +1995,72 @@ return inx;
       }
     }
     return crawlIds;
+  }
+
+  /**
+   * Per-URL progress log, written to redis as the crawl runs.
+   *
+   * The crawler's own pages.jsonl is only complete once the crawl ends, so
+   * without this the runner has nothing to report while a long crawl is in
+   * flight — which is exactly when someone wants to know whether it is
+   * progressing. Read by CrawlPageTracker on the runner side.
+   */
+  async logUrlStart(url: string, retry: number = 0) {
+    const logData = {
+      started: new Date().toISOString(),
+      retry: retry,
+    };
+
+    await this.redis.hset(this.urlLogKey, url, JSON.stringify(logData));
+
+    // Chronological order is kept separately, and only for first attempts —
+    // a retry is the same URL, not a new one.
+    if (retry === 0) {
+      await this.redis.lpush(this.urlLogOrderKey, url);
+    }
+  }
+
+  async logUrlFinish(url: string, status: number, retry: number = 0) {
+    const existingData = await this.redis.hget(this.urlLogKey, url);
+    let logData: Record<string, unknown> = {};
+
+    if (existingData) {
+      try {
+        logData = JSON.parse(existingData);
+      } catch (e) {
+        // A corrupt entry is not worth failing a page over; start clean.
+        logData = {};
+      }
+    }
+
+    logData.finished = new Date().toISOString();
+    logData.status = status;
+    logData.retry = retry;
+
+    await this.redis.hset(this.urlLogKey, url, JSON.stringify(logData));
+  }
+
+  /**
+   * Drop this crawl's keys when it finishes.
+   *
+   * The redis instance is shared per task and its RDB dump is carried forward
+   * to the next crawl in the chain, so keys that are not cleaned up accumulate
+   * across every crawl a site ever runs.
+   *
+   * Only `{crawlId}:*` is removed. The dedupe index lives under `h:`, `c:` and
+   * `allhashes`, which is deliberate — that data is what the chain is carrying
+   * forward, and deleting it here would silently disable cross-crawl dedupe.
+   */
+  async cleanupRedis() {
+    if (!this.crawlId) {
+      return;
+    }
+
+    await this.redis.defineCommand("deleteWithPrefix", {
+      numberOfKeys: 0,
+      lua: "local keys = redis.call('keys', ARGV[1]) \n for i=1,#keys,5000 do \n redis.call('del', unpack(keys, i, math.min(i+4999, #keys))) \n end \n return keys",
+    });
+
+    await this.redis.deleteWithPrefix(this.crawlId + ":*");
   }
 }
