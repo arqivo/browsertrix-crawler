@@ -53,6 +53,30 @@ async function handleTerminate(signame: string) {
   }
 }
 
+// undici's HTTP/1 parser can fail internal assertions (e.g. assert(!this.paused)
+// in Parser.finish) when a server ends the socket mid-parse. The AssertionError
+// escapes as an uncaughtException from a socket event and would kill the whole
+// crawl for one broken connection; undici opens a fresh connection on the next
+// request, so logging and continuing is safe. Anything else stays fatal.
+process.on("uncaughtException", (err) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const anyErr = err as any;
+  if (
+    anyErr?.code === "ERR_ASSERTION" &&
+    typeof anyErr?.stack === "string" &&
+    anyErr.stack.includes("undici")
+  ) {
+    logger.error("Ignoring undici internal assertion failure", {
+      message: anyErr.message,
+    });
+    return;
+  }
+  logger.fatal("Uncaught exception", {
+    message: anyErr?.message,
+    stack: anyErr?.stack,
+  });
+});
+
 process.on("SIGINT", () => handleTerminate("SIGINT"));
 
 process.on("SIGTERM", () => handleTerminate("SIGTERM"));
