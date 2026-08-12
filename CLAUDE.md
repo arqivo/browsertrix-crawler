@@ -47,6 +47,31 @@ docker buildx build --platform linux/arm64 -f Dockerfile -t arqivo-browsertrix-c
 
 Pushing to ECR and bumping the runner is a production change: get explicit approval first.
 
+## Shipping a change to production
+
+A new crawler image does **not** reach a crawl by existing. Five steps, in order:
+
+1. **Tag it `<upstream>-dipN`.** `N` increments per fork patch level, so a release row pins the
+   exact patch level and upstream's own tag is never shadowed. `1.14.0-dip1` = v1.14.0 + the
+   undici guard. Tags are immutable — never re-push an existing one; that breaks rollback.
+2. **Point the runner at it** — `arqivo-task-runner`, three places:
+   `HarvestService::$browsertrixImage` (prod), `browsertrixImageOptions()` (the arm64 tag used
+   when `APP_ENV=local`), and `AgentRunnerService` (same pair, for agent runs).
+3. **Build/push the runner image and add a `task_runner_releases` row.** Put the crawler image in
+   that row's `image_dependencies` (comma-separated) next to `worker_image`. This is what makes
+   the image *arrive*: `arqivo-task-host` does `loginToECR()` and pre-pulls every dependency for
+   the release before running a task. Forget it and the crawl server has no credentialed pull.
+4. **Canary before default.** `CrawlService` takes the newest `task_runner_releases` row with
+   `enabled = 1` as default, unless the site has `sites.forceReleaseId` set. So: insert the row
+   with `enabled = 0`, set `forceReleaseId` on one or two sites, let them crawl, then enable the
+   row. `forceReleaseId` has no API or UI — it is SQL-only, like `crawl_rules`.
+5. **Roll back by disabling the row** (`enabled = 0`); the previous newest enabled row becomes
+   default again on the next scheduling pass. No image work, no revert commit.
+
+The crawl record stores `releaseId` and `crawlerImage`, so "which image ran this crawl" is
+answerable after the fact — but check the task log's `Starting crawler with config` line when
+they disagree: the log is what actually ran.
+
 ## Testing a change
 
 Run a real crawl rather than reasoning about it — a one-page crawl takes seconds:

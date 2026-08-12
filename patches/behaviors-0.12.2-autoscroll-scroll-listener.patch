@@ -1,0 +1,149 @@
+From c1aa672f8db797cb4aef500e1d4cbad89288f7bb Mon Sep 17 00:00:00 2001
+From: Wouter van Lent <woutervanlent@gmail.com>
+Date: Wed, 12 Aug 2026 14:47:28 +0200
+Subject: [PATCH] autoscroll: remove getEventListeners() scroll handler check,
+ as it never resolves
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`getEventListeners()` is a DevTools command line API and is undefined in a
+normal page context, which is where behaviors run. Before #108 the call threw
+and the catch returned true ("assume has listeners"), so the check was a no-op
+and `shouldScroll()` fell through to the iframe heuristic and the live probe.
+
+#108 made the call optional (`self["getEventListeners"]?.(obj).scroll`), which
+short-circuits the whole chain to `undefined` instead of throwing. All three
+lookups now read as "no scroll listener", so `shouldScroll()` returns false at
+the first gate and autoscroll never runs — the iframe heuristic and the
+scroll-height/fetch probe below it are unreachable.
+
+Reproduced on stock webrecorder/browsertrix-crawler 1.14.0 with default args:
+every page logs "Skipping autoscroll, page seems to not be responsive to
+scrolling events", including pages that grow while scrolled.
+
+Removing the check rather than restoring the throw, for the same reason it was
+removed from autoclick in #101: it cannot be answered reliably from page
+context. The two checks that can be answered — the iframe count and the probe
+that scrolls and looks for new content or fetches — are left to decide.
+
+Adds a regression test: a fixture page that appends content while it is
+scrolled, crawled the same way the existing autoscroll test crawls a static
+page. The static-page test still asserts the skip, so both directions are
+covered. The new test fails on the current build and passes with this change.
+---
+ .github/workflows/autoscroll.yaml | 14 +++++++++
+ src/autoscroll.ts                 | 18 ------------
+ test/fixtures/lazy-scroll.html    | 48 +++++++++++++++++++++++++++++++
+ 3 files changed, 62 insertions(+), 18 deletions(-)
+ create mode 100644 test/fixtures/lazy-scroll.html
+
+diff --git a/.github/workflows/autoscroll.yaml b/.github/workflows/autoscroll.yaml
+index 90b8e0a..81560b4 100644
+--- a/.github/workflows/autoscroll.yaml
++++ b/.github/workflows/autoscroll.yaml
+@@ -42,3 +42,17 @@ jobs:
+ 
+       - name: check that state is logged as well
+         run: grep '{"state":{"segments":1}' ./log
++
++      - name: run crawl on a page that grows while scrolling
++        run: |
++          python3 -m http.server 8888 --directory test/fixtures &
++          server_pid=$!
++          sleep 1
++          docker run --network host -v $PWD/dist/behaviors.js:/app/node_modules/browsertrix-behaviors/dist/behaviors.js $BROWSERTRIX_IMAGE crawl --url http://localhost:8888/lazy-scroll.html --limit 1 --logging debug --context behaviorScript --behaviors autoscroll > ./log-lazy
++          kill $server_pid
++
++      - name: check that autoscroll did not bail out
++        run: "! grep -q 'Skipping autoscroll' ./log-lazy"
++
++      - name: check that autoscroll actually scrolled
++        run: grep 'more scroll segments' ./log-lazy
+diff --git a/src/autoscroll.ts b/src/autoscroll.ts
+index d69193d..321ab12 100644
+--- a/src/autoscroll.ts
++++ b/src/autoscroll.ts
+@@ -84,25 +84,7 @@ export class AutoScroll
+     this.lastMsg = msg;
+   }
+ 
+-  hasScrollEL(obj: HTMLElement | Document | Window) {
+-    try {
+-      return !!self["getEventListeners"]?.(obj).scroll;
+-    } catch (_) {
+-      // unknown, assume has listeners
+-      this.debug("getEventListeners() not available");
+-      return true;
+-    }
+-  }
+-
+   async shouldScroll(ctx: Context<AutoScrollState, AutoScrollOpts>) {
+-    if (
+-      !this.hasScrollEL(self.window) &&
+-      !this.hasScrollEL(self.document) &&
+-      !this.hasScrollEL(self.document.body)
+-    ) {
+-      return false;
+-    }
+-
+     // if page has iframes, do scroll
+     if (window.frames.length >= 2) {
+       return true;
+diff --git a/test/fixtures/lazy-scroll.html b/test/fixtures/lazy-scroll.html
+new file mode 100644
+index 0000000..9275a4c
+--- /dev/null
++++ b/test/fixtures/lazy-scroll.html
+@@ -0,0 +1,48 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="utf-8" />
++    <title>Lazy scroll fixture</title>
++    <style>
++      body {
++        margin: 0;
++        font: 16px sans-serif;
++      }
++      .block {
++        height: 1200px;
++        padding: 8px;
++        border-bottom: 1px solid #ccc;
++      }
++    </style>
++  </head>
++  <body>
++    <div id="content"></div>
++    <script>
++      // A page that grows while it is scrolled: the shape autoscroll exists for.
++      // Bounded at MAX_BLOCKS so the crawl terminates.
++      const MAX_BLOCKS = 12;
++      const content = document.getElementById("content");
++      let count = 0;
++
++      function addBlock() {
++        const block = document.createElement("div");
++        block.className = "block";
++        block.textContent = "block " + ++count;
++        content.appendChild(block);
++      }
++
++      for (let i = 0; i < 3; i++) {
++        addBlock();
++      }
++
++      window.addEventListener("scroll", () => {
++        const nearBottom =
++          window.scrollY + window.innerHeight >
++          document.documentElement.scrollHeight - 1200;
++        if (count < MAX_BLOCKS && nearBottom) {
++          addBlock();
++        }
++      });
++    </script>
++  </body>
++</html>
+-- 
+2.50.1 (Apple Git-155)
+

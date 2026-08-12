@@ -141,6 +141,34 @@ Three ways to ship a patch, in increasing durability:
 The pinned 0.9.0 bundle older forks carried via the `COPY` line was byte-identical to stock and
 was dropped at 1.14.
 
+### Carrying one through our chain
+
+A behaviors patch is not a source change to this repo — the bundle is a dependency — so it needs
+a home and a rebuild trigger of its own:
+
+1. **The patch file lives in `patches/`**, as a `git format-patch` against the upstream behaviors
+   repo. `patches/behaviors-0.12.2-autoscroll-scroll-listener.patch` is the current example
+   (proposed upstream, not applied here). The filename carries the behaviors version it applies
+   to, because that is the thing that invalidates it.
+2. **Build the bundle in a container**, apply the patch, keep the result out of git (it is
+   generated):
+   ```bash
+   git clone --branch v0.12.2 https://github.com/webrecorder/browsertrix-behaviors.git /tmp/btb
+   cd /tmp/btb && git apply /path/to/patches/<file>.patch
+   docker run --rm -v /tmp/btb:/w -w /w node:22 sh -c "yarn install --frozen-lockfile && yarn build"
+   cp /tmp/btb/dist/behaviors.js ./behaviors.js   # next to the Dockerfile, for the COPY line
+   ```
+3. **A/B it before believing it** — mount both bundles against the same URL and diff the WARC
+   record counts, not the logs. A behaviors change that logs differently but captures identically
+   is not worth a fork patch (that is exactly what the autoscroll A/B showed).
+4. **Uncomment the `COPY behaviors.js` line**, build, and ship as `-dipN+1` through the five steps
+   in `CLAUDE.md` → *Shipping a change to production*. A behaviors-only change still needs a new
+   crawler tag, a runner bump and a release row: there is no path by which a bundle reaches a
+   crawl server on its own.
+5. **On the next upstream sync**, re-check whether the patch is still needed (the one-liner at
+   the end of this section) before rebuilding the bundle. If upstream merged it, delete the file
+   from `patches/` and re-comment the `COPY` line — a silently redundant patch is how forks rot.
+
 ### Known upstream defect: autoscroll never runs
 
 Since behaviors 0.10.0, `hasScrollEL()` uses `self["getEventListeners"]?.(obj).scroll`. That API
