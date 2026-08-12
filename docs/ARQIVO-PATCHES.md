@@ -2,7 +2,7 @@
 
 What this fork changes, why, and what to re-check when rebasing onto a new upstream release.
 
-**Base:** upstream `v1.14.0` · **Branch:** `arqivo-1.14.0` · **Image:** `arqivo-browsertrix-crawler:1.14.0-dip1`
+**Base:** upstream `v1.14.0` · **Branch:** `arqivo-1.14.0` · **Image:** `arqivo-browsertrix-crawler:1.14.0-dip2`
 
 Regenerate this view at any time:
 
@@ -92,7 +92,8 @@ mentions undici, and stays fatal for everything else. undici's HTTP/1 parser can
 event and would kill an entire crawl over one broken connection, while undici simply opens a new
 connection for the next request.
 
-This is the only difference between image tags `1.14.0` and `1.14.0-dip1`.
+This is the only difference between image tags `1.14.0` and `1.14.0-dip1`. `-dip2` adds the
+behaviors bundle below.
 
 ### 7–8. Dockerfile comments, deleted workflows
 

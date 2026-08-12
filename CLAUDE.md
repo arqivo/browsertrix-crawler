@@ -20,7 +20,7 @@ image without bumping that constant changes nothing in production.
 
 | Branch | What |
 |---|---|
-| `arqivo-1.14.0` | **current**, base `v1.14.0`, builds `1.14.0-dip1` |
+| `arqivo-1.14.0` | **current**, base `v1.14.0`, builds `1.14.0-dip2` |
 | `arqivo-1.7.0`, `arqivo-1.6.4`, `arqivo-1.2.1`, `arqivo` | previous bases, kept for reference |
 | `main` | upstream tracking |
 
@@ -42,7 +42,7 @@ aws ecr get-login-password --region eu-central-1 | docker login --username AWS -
 docker push 851725346735.dkr.ecr.eu-central-1.amazonaws.com/arqivo-browsertrix-crawler:<version>
 
 # local dev (arm64) — tag must match browsertrixImageOptions()
-docker buildx build --platform linux/arm64 -f Dockerfile -t arqivo-browsertrix-crawler-1.14.0-dip1 .
+docker buildx build --platform linux/arm64 -f Dockerfile -t arqivo-browsertrix-crawler-1.14.0-dip2 .
 ```
 
 Pushing to ECR and bumping the runner is a production change: get explicit approval first.
@@ -116,8 +116,9 @@ patches.
 
 ## Traps
 
-- **amd64 images will not run Chromium on an ARM Mac.** Use the arm64 local tag, or stock
-  upstream, for local work.
+- **amd64 images on an ARM Mac run under emulation** — slow, and historically Chromium would not
+  start at all. A one-page crawl with `:1.14.0-dip2` did work (2026-08-12), but use the arm64 local
+  tag for anything longer.
 - **Dedupe index must live in db 1** of the per-crawl redis, not db 0: the crawler gates its
   commit on `dedupeRedisUrl !== redisUrl` as a *string compare*. Same URL ⇒ index built, never
   committed, and nothing says so.
