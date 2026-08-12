@@ -103,21 +103,64 @@ dev-channel and docs-publish workflows are deleted so the fork does not run them
 
 ## Behaviors
 
-The image installs stock `browsertrix-behaviors` `^0.12.2` from npm; the fork ships no bundle.
-The pinned 0.9.0 bundle older forks carried was byte-identical to stock and was dropped at 1.14.
+**Not patched today** — the image runs stock behaviors. This section exists because that is a
+choice, and because the mechanism decides how a patch would be shipped if we reverse it.
 
-**Known upstream defect (autoscroll never runs).** Since behaviors 0.10.0, `hasScrollEL()` uses
-`self["getEventListeners"]?.(obj).scroll`. That API only exists in the DevTools console, so the
-optional call short-circuits to `undefined` instead of throwing into the fail-open `catch` —
-`shouldScroll()` returns false at the first gate and the iframe heuristic and scroll probe below
-it never run. Every page logs *"Skipping autoscroll, page seems to not be responsive to scrolling
-events"*, reproducible on stock `webrecorder/browsertrix-crawler:1.14.0`.
+### How the bundle gets into the image
 
-Measured impact on our fleet so far is **zero** — A/B on a genuinely scroll-lazy page (stock
-1.14, stock 1.12.3, and 1.14 with a patched fail-open bundle) produced identical WARCs — so no
-patch is carried. Fix proposed upstream from `~/Development/Arqivo/browsertrix-behaviors-pr`. If
-we ever need it before upstream merges, uncomment the `COPY behaviors.js` line in the Dockerfile
-and drop in a bundle built with `hasScrollEL` returning `true`.
+1. `package.json` declares `"browsertrix-behaviors": "^0.12.2"`; `yarn.lock` pins **0.12.2**.
+   The Dockerfile's `yarn install --frozen-lockfile` drops the prebuilt bundle at
+   `/app/node_modules/browsertrix-behaviors/dist/behaviors.js`. We build no behaviors ourselves.
+2. `src/crawler.ts` reads that file at module load —
+   `const btrixBehaviors = fs.readFileSync("../node_modules/browsertrix-behaviors/dist/behaviors.js")`.
+   It is read from disk at process start; `tsc` does **not** bundle it into `dist/crawler.js`.
+3. Per page: `browser.addInitScript(page, btrixBehaviors)`, then an init script runs
+   `self.__bx_behaviors.init(behaviorOpts, false)` + `selectMainBehavior()`, and later
+   `self.__bx_behaviors.run()`.
+
+Because of step 2, **replacing that one file changes behavior with no rebuild**:
+
+```bash
+docker run -v $PWD/behaviors.js:/app/node_modules/browsertrix-behaviors/dist/behaviors.js <image> crawl ...
+```
+
+That is how upstream's own behaviors CI tests a build, and the cheapest way to A/B a suspected
+behaviors problem against stock. Note `--customBehaviors` is a *different* channel: it `load()`s
+extra behaviors alongside the built-ins and does not replace autoscroll — though a custom
+behavior whose `isMatch()` matches wins over autoscroll for that page via `selectMainBehavior()`,
+which is what our `crawl_scripts` use.
+
+Three ways to ship a patch, in increasing durability:
+
+| Way | Survives | Use for |
+|---|---|---|
+| Mount over the path at `docker run` | nothing | testing, one-off diagnosis |
+| Uncomment `COPY behaviors.js …` in the Dockerfile | rebuilds, not version bumps | carrying a fix until upstream merges |
+| Point the `package.json` dependency at a git ref | rebuilds and bumps | a fix upstream will not take |
+
+The pinned 0.9.0 bundle older forks carried via the `COPY` line was byte-identical to stock and
+was dropped at 1.14.
+
+### Known upstream defect: autoscroll never runs
+
+Since behaviors 0.10.0, `hasScrollEL()` uses `self["getEventListeners"]?.(obj).scroll`. That API
+only exists in the DevTools console, so the optional call short-circuits to `undefined` instead of
+throwing into the fail-open `catch` — `shouldScroll()` returns false at the first gate, and the
+iframe heuristic and scroll probe below it never run. Every page logs *"Skipping autoscroll, page
+seems to not be responsive to scrolling events"*, reproducible on stock
+`webrecorder/browsertrix-crawler:1.14.0` with default arguments.
+
+**We deliberately carry no patch for this.** A/B on a genuinely scroll-lazy page (stock 1.14,
+stock 1.12.3 with behaviors 0.9.8, and 1.14 with a fail-open bundle mounted) produced identical
+WARCs — 307 records each. The crawler's viewport and autofetch already reach what scrolling would
+trigger, so patching would add fork surface for no measured gain. Revisit if a site is found where
+the A/B differs; the fix is `hasScrollEL` returning `true` (minified: `hasScrollEL(t){try{return!0}`).
+
+On each rebase, check whether the behaviors version the new release depends on still has it:
+
+```bash
+docker run --rm <image> sh -c 'grep -c "getEventListeners?" /app/node_modules/browsertrix-behaviors/dist/behaviors.js'
+```
 
 ## Rebasing onto a new upstream release
 
