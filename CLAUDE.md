@@ -129,5 +129,6 @@ patches.
 - **Counting after 1.14:** cross-crawl dedupe turns repeated identical responses into revisits, so
   response counts, `statusCounts` and per-day ES record counts all drop while coverage is
   unchanged. Compare **distinct URLs** across the 2026-08-07 boundary, never response counts.
-- **Autoscroll never runs** on the behaviors version this image ships — upstream defect, no
-  measured impact on our sites, details and A/B method in `docs/ARQIVO-PATCHES.md`.
+- **Autoscroll never runs on stock behaviors 0.10+** (upstream defect). Our bundle fixes it from
+  `-dip2`; a stock image is the wrong control when testing scroll-dependent capture. Details and
+  A/B method in `docs/ARQIVO-PATCHES.md`.
