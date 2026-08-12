@@ -85,7 +85,7 @@ RUN mkdir -p /app/behaviors
 WORKDIR /crawls
 
 # Our behaviors bundle replaces the stock one installed by yarn. Built from
-# browsertrix-behaviors v0.12.3 + patches/000*.patch — see docs/ARQIVO-PATCHES.md
+# browsertrix-behaviors v0.12.3 + patches/0001-*.patch — see docs/ARQIVO-PATCHES.md
 # for what they change and how to rebuild after an upstream sync. Without this,
 # autoscroll never runs (upstream regression since behaviors 0.10.0).
 COPY behaviors.js /app/node_modules/browsertrix-behaviors/dist/behaviors.js
