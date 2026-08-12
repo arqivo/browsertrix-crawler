@@ -193,9 +193,18 @@ setting `html { scroll-behavior: smooth }`. One page each, crawler 1.14.0, `--be
 | 0.9.0 (what the 1.6.4 image shipped) | 10 of 10 | — | 4.3s |
 | **ours: 0.12.3 + `0001`** | 10 of 10 | 10 of 10 | 3.9s |
 
-The 1.14 upgrade did cost real capture on pages of this shape, and `0001` alone restores it — the
-probe's `numFetching` branch already fires once the jump to 98% triggers the observers, so the
-extra permissiveness in `not-applied/0002` changes nothing here.
+The 1.14 upgrade did cost real capture on pages of this shape, and `0001` alone restores it.
+
+Note *how*, because it bounds the claim: with `0001` the behavior still logs `Skipping autoscroll`
+on these fixtures — `shouldScroll()`'s probe jumps to 98% of the page and back before deciding, and
+that jump alone fires the observers and loads everything. The gate previously returned false
+*before* the probe ran, so no scroll happened at all and only the first viewport was captured. The
+win is the probe executing, not `scrollDown()`.
+
+Consequence: a page needing *gradual* scrolling — content that only loads when an element dwells in
+the viewport, or that appends in steps — can still be under-captured with `0001` alone, because the
+probe will conclude "no reaction" and skip. That is the case `not-applied/0002` was written for, and
+the case to look for before dismissing it.
 
 This is *not* what happened to site 234: those iframes load without scrolling, and stock 1.12.3,
 stock 1.14 and a patched 1.14 produced identical WARCs there (307 records). Do not conflate them.
