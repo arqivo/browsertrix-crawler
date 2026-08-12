@@ -82,8 +82,33 @@ docker run --rm -v $PWD/out:/crawls <image> \
 ```
 
 Behavior yields only appear with `--logging behaviors`; production task logs from 1.14 include
-`behaviorScript` lines, older ones do not. To test a modified behaviors bundle, mount it:
-`-v $PWD/behaviors.js:/app/node_modules/browsertrix-behaviors/dist/behaviors.js`.
+`behaviorScript` lines, older ones do not.
+
+## Behaviors
+
+Two different things both called "behaviors" — keep them apart:
+
+| | Path in container | Comes from | Selected by |
+|---|---|---|---|
+| **Built-in** (autoscroll, autofetch, autoplay, site-specific) | `/app/node_modules/browsertrix-behaviors/dist/behaviors.js` | **our `behaviors.js`**, copied over the npm one at build | `--behaviors` |
+| **Per-site** | `/app/behaviors/<name>.js` | `crawl_scripts` rows, written per crawl by the runner | `--customBehaviors` |
+
+The built-in bundle is read from disk by `crawler.ts` at process start — not compiled in — so
+mounting over that path swaps it with **no rebuild**, which is how to A/B a behaviors change:
+
+```bash
+docker run --rm -v <vol>:/crawls -v $PWD/behaviors.js:/app/node_modules/browsertrix-behaviors/dist/behaviors.js:ro \
+  <image> crawl --url <url> --limit 1 --behaviors autoscroll --logging stats,behaviors
+```
+
+`--customBehaviors` is additive — it cannot fix a built-in, but a custom behavior whose
+`isMatch()` matches wins over autoscroll for that page via `selectMainBehavior()`. It is a yargs
+array option that does **not** split commas: a comma-joined value is `stat()`ed as one path and
+the crawl exits `fatal(17)` with more than one behavior.
+
+Editing the bundle means editing `~/Development/Arqivo/browsertrix-behaviors` (branch
+`arqivo-0.12.3`), rebuilding, and copying `dist/behaviors.js` here — full recipe and the reason
+each patch exists in `docs/ARQIVO-PATCHES.md`. Never hand-edit `behaviors.js`: it is generated.
 
 Note the tags in `docker image ls`: `webrecorder/browsertrix-crawler:*` are stock upstream and are
 the control group for "is this us or upstream?" — a question worth answering before debugging our

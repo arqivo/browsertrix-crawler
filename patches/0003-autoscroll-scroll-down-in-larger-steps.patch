@@ -1,0 +1,35 @@
+From c790bfe4acad85f2be6f6a354b87c9308d4ff014 Mon Sep 17 00:00:00 2001
+From: Wouter van Lent <woutervanlent@gmail.com>
+Date: Wed, 12 Aug 2026 15:12:18 +0200
+Subject: [PATCH 3/3] autoscroll: scroll down in larger steps
+
+Counterweight to the probe change: upstream's 30px/75ms assumes autoscroll only
+runs on infinite-scroll pages. Now that it runs on ordinary pages too, 400px/s
+would add tens of seconds per page across a whole crawl.
+
+Only scrollDown() is changed; scrollUp() keeps upstream's increment, since it
+runs rarely and on pages that anchor at the bottom.
+---
+ src/autoscroll.ts | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/autoscroll.ts b/src/autoscroll.ts
+index 50faa2f..ad36af4 100644
+--- a/src/autoscroll.ts
++++ b/src/autoscroll.ts
+@@ -170,7 +170,11 @@ export class AutoScroll
+       return;
+     }
+ 
+-    const scrollInc = Math.min(scrollElem.clientHeight * 0.1, 30);
++    // ARQIVO: 30px per 75ms is 400px/s — a 10.000px page costs 25s, and with the
++    // probe above autoscroll now runs on ordinary pages, not just infinite-scroll
++    // ones, so that cost lands on every page of every crawl. 200px per 75ms still
++    // puts every viewport-height of content on screen for several ticks.
++    const scrollInc = Math.min(scrollElem.clientHeight * 0.3, 200);
+     const interval = 75;
+     let elapsedWait = 0;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

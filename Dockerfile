@@ -84,10 +84,11 @@ RUN mkdir -p /app/behaviors
 
 WORKDIR /crawls
 
-# To test a custom behaviors build, drop a bundle here and uncomment:
-# (the arqivo fork used to ship a pinned 0.9.0 bundle this way; 1.14 depends on
-#  browsertrix-behaviors ^0.12.2 directly, so the pin would be a downgrade)
-# COPY behaviors.js /app/node_modules/browsertrix-behaviors/dist/behaviors.js
+# Our behaviors bundle replaces the stock one installed by yarn. Built from
+# browsertrix-behaviors v0.12.3 + patches/000*.patch — see docs/ARQIVO-PATCHES.md
+# for what they change and how to rebuild after an upstream sync. Without this,
+# autoscroll never runs (upstream regression since behaviors 0.10.0).
+COPY behaviors.js /app/node_modules/browsertrix-behaviors/dist/behaviors.js
 
 # add brave/chromium group policies
 RUN mkdir -p /etc/brave/policies/managed/

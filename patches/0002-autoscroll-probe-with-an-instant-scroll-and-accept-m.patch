@@ -1,0 +1,60 @@
+From 6bb627f0f52bfbbf9414a32f4eaaac5f2fb3380a Mon Sep 17 00:00:00 2001
+From: Wouter van Lent <woutervanlent@gmail.com>
+Date: Wed, 12 Aug 2026 15:11:51 +0200
+Subject: [PATCH 2/3] autoscroll: probe with an instant scroll and accept
+ movement as a reaction
+
+Two changes to shouldScroll()'s probe, both restoring behaviour our 1.6.4-era
+crawler had:
+
+- jump with behavior "auto" instead of "smooth". A smooth programmatic scroll
+  is animated and gets cancelled on sites setting html{scroll-behavior:smooth},
+  so the page never moves and the probe concludes the page ignores scrolling.
+- treat "scrollY changed" as a reaction alongside "scrollHeight grew" and "the
+  autofetcher started fetching". Growth only detects infinite scroll; pages that
+  lazy-load in place at a fixed height are the common case in our fleet and were
+  classified as not needing autoscroll.
+---
+ src/autoscroll.ts | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/autoscroll.ts b/src/autoscroll.ts
+index 321ab12..50faa2f 100644
+--- a/src/autoscroll.ts
++++ b/src/autoscroll.ts
+@@ -96,20 +96,29 @@ export class AutoScroll
+     }
+ 
+     const lastScrollHeight = scrollElem.scrollHeight;
++    const lastScrollY = self.window.scrollY;
+     const numFetching = ctx.opts.autoFetcher.numFetching;
+ 
+     // scroll to almost end of page
+     const scrollEnd = scrollElem.scrollHeight * 0.98 - self.innerHeight;
+ 
+-    window.scrollTo({ top: scrollEnd, left: 0, behavior: "smooth" });
++    // ARQIVO: "auto", never "smooth". A smooth programmatic scroll is animated,
++    // and on sites with `html { scroll-behavior: smooth }` the animation is
++    // cancelled outright — the page never moves, and the probe below reads that
++    // as "does not react to scrolling". Upstream used "auto" here until 0.9.x.
++    window.scrollTo({ top: scrollEnd, left: 0, behavior: "auto" });
+ 
+     // wait for any updates
+     await sleep(500);
+ 
+-    // scroll height changed, should scroll
++    // ARQIVO: the page reacted if it grew, started fetching, or simply moved.
++    // Upstream tests only the first two, which limits autoscroll to pages that
++    // grow (infinite scroll) and skips every page that lazy-loads in place at a
++    // fixed height — the common case in our fleet.
+     if (
+       lastScrollHeight !== scrollElem.scrollHeight ||
+-      numFetching < ctx.opts.autoFetcher.numFetching
++      numFetching < ctx.opts.autoFetcher.numFetching ||
++      lastScrollY !== self.window.scrollY
+     ) {
+       window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+       return true;
+-- 
+2.50.1 (Apple Git-155)
+

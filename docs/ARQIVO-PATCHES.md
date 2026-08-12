@@ -23,6 +23,7 @@ git log --oneline v1.14.0..arqivo-1.14.0
 | 6 | undici assertion guard | `src/main.ts` | Low |
 | 7 | Build/push documentation | `Dockerfile` | None (comments only) |
 | 8 | Upstream CI/release workflows deleted | `.github/workflows/*` | None |
+| 9 | Own behaviors bundle (3 autoscroll patches) | `behaviors.js`, `patches/`, `Dockerfile` | **High** — rebuild required on every behaviors version bump |
 
 ---
 
@@ -103,8 +104,10 @@ dev-channel and docs-publish workflows are deleted so the fork does not run them
 
 ## Behaviors
 
-**Not patched today** — the image runs stock behaviors. This section exists because that is a
-choice, and because the mechanism decides how a patch would be shipped if we reverse it.
+**Patched.** `behaviors.js` in the repo root is our own build — browsertrix-behaviors **v0.12.3**
+plus `patches/000*.patch` — and the Dockerfile copies it over the stock bundle yarn installs.
+Source of truth for the patches is the `arqivo-0.12.3` branch of
+`~/Development/Arqivo/browsertrix-behaviors` (`upstream` remote = webrecorder).
 
 ### How the bundle gets into the image
 
@@ -169,22 +172,67 @@ a home and a rebuild trigger of its own:
    the end of this section) before rebuilding the bundle. If upstream merged it, delete the file
    from `patches/` and re-comment the `COPY` line — a silently redundant patch is how forks rot.
 
-### Known upstream defect: autoscroll never runs
+### What the three patches fix
 
-Since behaviors 0.10.0, `hasScrollEL()` uses `self["getEventListeners"]?.(obj).scroll`. That API
-only exists in the DevTools console, so the optional call short-circuits to `undefined` instead of
-throwing into the fail-open `catch` — `shouldScroll()` returns false at the first gate, and the
-iframe heuristic and scroll probe below it never run. Every page logs *"Skipping autoscroll, page
-seems to not be responsive to scrolling events"*, reproducible on stock
-`webrecorder/browsertrix-crawler:1.14.0` with default arguments.
+**`0001` — the scroll-listener gate never resolves.** Since behaviors 0.10.0, `hasScrollEL()` uses
+`self["getEventListeners"]?.(obj).scroll`. That API only exists in the DevTools console, so the
+optional call short-circuits to `undefined` instead of throwing into the fail-open `catch` —
+`shouldScroll()` returns false at the first gate, and the iframe heuristic and scroll probe below
+it never run. **Autoscroll never runs at all**, on any page, reproducible on stock
+`webrecorder/browsertrix-crawler:1.14.0` with default arguments. Proposed upstream; drop this
+patch once it lands.
 
-**We deliberately carry no patch for this.** A/B on a genuinely scroll-lazy page (stock 1.14,
-stock 1.12.3 with behaviors 0.9.8, and 1.14 with a fail-open bundle mounted) produced identical
-WARCs — 307 records each. The crawler's viewport and autofetch already reach what scrolling would
-trigger, so patching would add fork surface for no measured gain. Revisit if a site is found where
-the A/B differs; the fix is `hasScrollEL` returning `true` (minified: `hasScrollEL(t){try{return!0}`).
+**`0002` — the probe misses pages that lazy-load in place.** Upstream jumps to 98% of the page
+with `behavior: "smooth"` and concludes the page reacts only if `scrollHeight` grew or the
+autofetcher started fetching. Two problems: a smooth programmatic scroll is animated and gets
+cancelled on sites setting `html { scroll-behavior: smooth }` (the page never moves), and "grew"
+only describes infinite scroll — a page that reserves its height and fills boxes via
+`IntersectionObserver` never grows. Patch: jump with `"auto"`, and accept "scrollY changed" as a
+reaction too. Upstream used `"auto"` here until 0.9.x.
 
-On each rebase, check whether the behaviors version the new release depends on still has it:
+**`0003` — scroll increment 30px → 200px per 75ms tick.** The counterweight to `0002`: upstream's
+400px/s assumes autoscroll only runs on infinite-scroll pages, and once it runs everywhere that
+cost lands on every page of every crawl. Only `scrollDown()` changes; `scrollUp()` keeps upstream's
+increment. Upstream issue #18 complains autoscroll is *too fast* already, so if content ever looks
+half-captured on a slow-loading site, this constant is the first thing to try reverting.
+
+### Measured effect
+
+Fixture: a fixed-height page whose 10 images load via `IntersectionObserver` — the case `0002`
+targets. One page, crawler 1.14.0, `--behaviors autoscroll`:
+
+| bundle | lazy images captured | page wall-clock |
+|---|---|---|
+| stock 0.12.2 (what prod runs today) | **2 of 10** | 5.6s |
+| 0.9.0 (what the 1.6.4 image shipped) | 10 of 10 | 4.3s |
+| ours (0.12.3 + patches) | 10 of 10 | 7.2s |
+
+So the 1.14 upgrade did cost real capture on pages of this shape, and this bundle restores it. It
+is *not* what happened to site 234 — that site's iframes load without scrolling, and stock 1.12.3
+vs stock 1.14 vs a patched 1.14 all produced identical WARCs there (307 records). Do not conflate
+the two.
+
+### Rebuilding after an upstream sync
+
+```bash
+cd ~/Development/Arqivo/browsertrix-behaviors
+git fetch upstream --tags
+git checkout -b arqivo-<newver> v<newver>
+git am ~/Development/Arqivo/browsertrix-crawler/patches/000*.patch   # drop 0001 if merged upstream
+docker run --rm -v "$PWD:/w" -w /w node:22 sh -c "yarn install --frozen-lockfile && yarn lint:check && yarn run build"
+cp dist/behaviors.js ~/Development/Arqivo/browsertrix-crawler/behaviors.js
+git format-patch v<newver>..HEAD -o ~/Development/Arqivo/browsertrix-crawler/patches/
+```
+
+Then re-run the A/B before trusting it — mount the old and new bundle over the same image and
+compare captured records, not log lines:
+
+```bash
+docker run --rm -v <vol>:/crawls -v $PWD/behaviors.js:/app/node_modules/browsertrix-behaviors/dist/behaviors.js:ro \
+  webrecorder/browsertrix-crawler:<ver> crawl --url <url> --limit 1 --behaviors autoscroll --logging stats,behaviors
+```
+
+Check whether `0001` is still needed:
 
 ```bash
 docker run --rm <image> sh -c 'grep -c "getEventListeners?" /app/node_modules/browsertrix-behaviors/dist/behaviors.js'
