@@ -15,6 +15,8 @@ import {
   CrawlStatus,
   SkippedReason,
   RATE_LIMIT_TTL_SECS,
+  MAX_RATE_BACKOFF_SECS,
+  RATE_BACKOFF_LEVEL_TTL_SECS,
 } from "./constants.js";
 import { ScopedSeed } from "./seeds.js";
 import { Frame } from "puppeteer-core";
@@ -1148,6 +1150,77 @@ return inx;
     await this.redis.del(this.pkey + ":" + url);
 
     await this.redis.sadd(this.exKey, url);
+  }
+
+  /**
+   * Shared back-off window: every worker waits, not just the one refused.
+   *
+   * A rate limit belongs to the host, not to the worker that happened to hit
+   * it, so a per-worker sleep only slows the crawl by 1/workers while the rest
+   * keep hammering. This key lives in the per-crawl redis every worker already
+   * shares, so one refusal pauses the whole crawl.
+   *
+   * Never shortens an existing window — the longest back-off wins, and a
+   * second worker landing on the same 429 cannot cut the first one's wait
+   * short. Capped, because a mistaken Retry-After (they are occasionally
+   * hours) must not strand a crawl.
+   */
+  async setRateBackoff(seconds: number) {
+    const capped = Math.max(
+      0,
+      Math.min(Math.round(seconds), MAX_RATE_BACKOFF_SECS),
+    );
+    if (!capped) {
+      return 0;
+    }
+
+    const key = this.crawlId + ":rateBackoff";
+    const current = await this.redis.ttl(key);
+    if (current >= capped) {
+      return current;
+    }
+
+    await this.redis.set(key, "1", "EX", capped);
+    return capped;
+  }
+
+  /**
+   * Count this refusal, for the PREVENTION side only.
+   *
+   * Deliberately not what sizes the pause: the pause exists to outlast the
+   * limit currently in force, and how long that takes is the host's business
+   * (Retry-After, or our configured guess). How often we end up waiting is a
+   * different question — it says the pace we resume at is still too fast — and
+   * that is what this level drives: first a longer delay between pages, then
+   * fewer workers. The level expires after a quiet spell, so a crawl that
+   * settles down climbs back to full speed on its own.
+   */
+  async incRateLimitLevel(): Promise<number> {
+    const levelKey = this.crawlId + ":rateBackoffLevel";
+    const level = await this.redis.incr(levelKey);
+    await this.redis.expire(levelKey, RATE_BACKOFF_LEVEL_TTL_SECS);
+    return level;
+  }
+
+  /** Seconds still to wait, or 0 when the window has passed. */
+  async rateBackoffRemaining(): Promise<number> {
+    const ttl = await this.redis.ttl(this.crawlId + ":rateBackoff");
+    return ttl > 0 ? ttl : 0;
+  }
+
+  /**
+   * How many rungs up the ladder this crawl currently is. Shared, so every
+   * worker derives the same concurrency cap from it, and self-expiring, so a
+   * crawl that stops being refused climbs back down without bookkeeping.
+   */
+  async rateBackoffLevel(): Promise<number> {
+    const level = await this.redis.get(this.crawlId + ":rateBackoffLevel");
+    return level ? parseInt(level) || 0 : 0;
+  }
+
+  /** Nothing queued and nothing in flight — no reason to hold a worker. */
+  async noWorkLeft(): Promise<boolean> {
+    return (await this.queueSize()) === 0 && (await this.numPending()) === 0;
   }
 
   async incRateLimited(

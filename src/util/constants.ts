@@ -149,6 +149,21 @@ export const RATE_LIMIT_TTL_SECS = 300;
 
 export const DEFAULT_MAX_RATE_LIMIT_RETRIES = 4;
 
+// Ceiling for the shared rate-limit back-off. Retry-After is attacker- (or
+// misconfiguration-) controlled and is occasionally hours; a crawl that waits
+// that long is indistinguishable from a hung one.
+export const MAX_RATE_BACKOFF_SECS = 300;
+
+// How long a refusal keeps counting towards the prevention ladder. Long enough
+// that a crawl being refused every few minutes keeps climbing, short enough
+// that one bad patch does not slow the rest of a long crawl for no reason.
+export const RATE_BACKOFF_LEVEL_TTL_SECS = 600;
+
+// How often a held worker re-checks. Short enough that it releases promptly
+// when the window closes or the work runs out, long enough not to poll redis
+// in a tight loop.
+export const RATE_HOLD_POLL_SECS = 5;
+
 export type RateLimitRule = {
   regex: RegExp;
   status: number;

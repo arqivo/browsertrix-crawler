@@ -428,8 +428,15 @@ class ArgParser {
         pageExtraDelay: {
           alias: "delay",
           describe:
-            "If >0, amount of time to sleep (in seconds) after behaviors before moving on to next page",
+            "If >0, amount of time to sleep (in seconds) after behaviors before moving on to next page. Added unconditionally, even to pages that were already slow — see --minPageDuration for rate-shaping.",
           default: 0,
+          type: "number",
+        },
+
+        minPageDuration: {
+          describe:
+            "Minimum seconds a page occupies a worker. A page that finished faster is topped up to this; a page that took longer is not delayed at all. This is what bounds requests per second per worker, and 1s of it is basic politeness: at 0 a fast worker issues page loads back to back, which is what trips per-IP limiters.",
+          default: 1,
           type: "number",
         },
 
@@ -809,6 +816,48 @@ class ArgParser {
             "If set >=0, number of times to retry rate limited pages before marking them as failed. If -1, retry indefinitely",
           type: "number",
           default: DEFAULT_MAX_RATE_LIMIT_RETRIES,
+        },
+
+        rateLimitPause: {
+          describe:
+            "Seconds to pause the WHOLE crawl (all workers) after a rate-limited response, when the server sends no Retry-After. This waits out the limit in force; it does not grow with repetition. 0 disables pausing entirely.",
+          type: "number",
+          default: 20,
+        },
+
+        rateLimitPauseAmbiguous: {
+          describe:
+            "Also treat 403/503 without a Retry-After as rate limiting. Off by default: sites that 403 a members' area on every crawl would otherwise pause constantly.",
+          type: "boolean",
+          default: false,
+        },
+
+        rateLimitPaceStep: {
+          describe:
+            "Seconds added to --minPageDuration per rate-limit rung, so the crawl resumes at a slower page rate than the one that got it refused. Ratchets up only, never down within a crawl. 0 disables.",
+          type: "number",
+          default: 1,
+        },
+
+        rateLimitPaceMax: {
+          describe:
+            "Ceiling for the EXTRA seconds the rate-limit ratchet may add to --minPageDuration",
+          type: "number",
+          default: 10,
+        },
+
+        rateLimitMinWorkers: {
+          describe:
+            "Floor for the concurrency the rate-limit ratchet may drop to. Must be >= 1 so the crawl always has a runner; set equal to --workers to never drop concurrency.",
+          type: "number",
+          default: 1,
+        },
+
+        rateLimitWorkerThreshold: {
+          describe:
+            "Rungs to tolerate before dropping a worker. Delay is the cheaper lever, so concurrency only falls once slowing down has already failed.",
+          type: "number",
+          default: 2,
         },
 
         rateLimitInterruptCount: {

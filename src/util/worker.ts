@@ -24,6 +24,8 @@ export type WorkerState = {
   frameIdToExecId: Map<string, number>;
   isAuthSet?: boolean;
   pageBlockUnload?: boolean;
+  // When work on this page began, for the minimum-page-duration pacing.
+  pageStartTime?: number;
   data: PageState;
 };
 
@@ -278,7 +280,10 @@ export class PageWorker {
       await Promise.race([
         timedRun(
           this.crawlPage(opts),
-          this.maxPageTime,
+          // read live, not the value snapshotted at worker creation: the
+          // rate-limit pace ratchet raises pageExtraDelay mid-crawl, and
+          // maxPageTime is the budget that delay is spent inside.
+          this.crawler.maxPageTime,
           "Page Worker Timeout",
           this.logDetails,
           "worker",
@@ -355,6 +360,12 @@ export class PageWorker {
       await crawlState.processMessage(this.crawler.seeds, (data: QueueEntry) =>
         this.crawler.markExcluded(data, SkippedReason.ExcludedMidCrawl),
       );
+
+      // Hold here, before claiming a page: inside crawlPage the wait would run
+      // within the maxPageTime budget that worker.ts wraps around it, so a
+      // long back-off would time the page out and turn a rate limit into a
+      // failed page — and the claim would sit in redis going stale meanwhile.
+      await this.crawler.awaitRateBackoff(this.id);
 
       const data = await crawlState.nextFromQueue();
 

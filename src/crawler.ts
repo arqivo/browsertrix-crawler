@@ -54,6 +54,7 @@ import {
   STATUS_CONNECTION_ERROR,
   STATUS_IS_HTML_NO_DIRECT_FETCH,
   STATUS_DNS_ERROR,
+  RATE_HOLD_POLL_SECS,
 } from "./util/constants.js";
 
 import { AdBlockRules, BlockRuleDecl, BlockRules } from "./util/blockrules.js";
@@ -182,6 +183,13 @@ export class Crawler {
   skipTextDocs = 0;
 
   interruptReason: InterruptReason | null = null;
+
+  // Penalty pace the crawl has LEARNED, kept apart from params.pageExtraDelay,
+  // which is what the operator configured for this site. Two different things:
+  // one is a decision, the other is what a host taught us this run. Sharing a
+  // variable would make the configured value a lie in logs and leave nothing
+  // to report as "this is what the rate limiting cost us".
+  rateLimitExtraDelay = 0;
   finalExit = false;
   uploadAndDeleteLocal = false;
   done = false;
@@ -282,7 +290,8 @@ export class Crawler {
       this.params.pageLoadTimeout +
       this.params.behaviorTimeout +
       PAGE_OP_TIMEOUT_SECS * 2 +
-      this.params.pageExtraDelay;
+      this.params.pageExtraDelay +
+      this.params.minPageDuration;
 
     this.emulateDevice = this.params.emulateDevice || {};
 
@@ -1146,6 +1155,8 @@ self.__bx_behaviors.selectMainBehavior();
   }
 
   async crawlPage(opts: WorkerState): Promise<void> {
+    opts.pageStartTime = Date.now();
+
     await this.writeStats();
 
     const { page, cdp, data, workerid, recorder } = opts;
@@ -1420,20 +1431,166 @@ self.__bx_behaviors.selectMainBehavior();
     await Actions.runPostLoad(url, page, logger, logDetails, this, data);
   }
 
+  /**
+   * Hold this worker while the host is telling us to slow down.
+   *
+   * Two reasons to hold: a shared back-off window is open, or this worker is
+   * above the concurrency cap the crawl has dropped to. Both are derived from
+   * state in the per-crawl redis, so every worker sees the same picture —
+   * including workers that were idle when the refusal came in.
+   *
+   * Called from the worker loop BEFORE a page is claimed. Holding inside
+   * crawlPage would run inside the maxPageTime budget worker.ts wraps around
+   * it, so a long back-off would time the page out and convert a rate limit
+   * into a failed page, and the claim would go stale in redis while we waited.
+   *
+   * Three ways out, so a held worker can never be the reason a crawl hangs:
+   *  - the crawl is stopping (interrupt, cancel, pause)
+   *  - there is no work left, so holding would only delay the finish
+   *  - the hold expired (the back-off TTL, or the level decaying past the cap)
+   */
+  async awaitRateBackoff(workerid: WorkerId) {
+    let announced = false;
+
+     
+    while (true) {
+      if (this.interruptReason || !(await this.isCrawlRunning())) {
+        return;
+      }
+
+      const remaining = await this.crawlState.rateBackoffRemaining();
+      const capped = workerid >= (await this.allowedWorkers());
+
+      if (!remaining && !capped) {
+        return;
+      }
+
+      // Never let a hold outlive the work. Without this a parked worker would
+      // sit out its window while the others drain the queue, adding up to the
+      // whole back-off to the crawl's wall time for no benefit — and a
+      // concurrency cap, which has no TTL of its own, would hold forever.
+      if (await this.crawlState.noWorkLeft()) {
+        return;
+      }
+
+      if (!announced) {
+        announced = true;
+        logger.info(
+          "Rate limit hold, pausing worker",
+          {
+            workerid,
+            seconds: remaining,
+            until: remaining
+              ? new Date(Date.now() + remaining * 1000).toISOString()
+              : null,
+            reason: capped ? "concurrency-cap" : "back-off",
+          },
+          "pageStatus",
+        );
+      }
+
+      await sleep(
+        Math.min(remaining || RATE_HOLD_POLL_SECS, RATE_HOLD_POLL_SECS),
+      );
+    }
+  }
+
+  /**
+   * Raise the between-page delay one rung, and keep it there for the rest of
+   * the crawl. Returns the delay now in force.
+   *
+   * params.pageExtraDelay is read fresh for every page, so assigning to it
+   * takes effect from the next page on every worker in this process.
+   */
+  rateLimitPace(level: number): number {
+    const step = this.params.rateLimitPaceStep;
+    if (!step) {
+      return this.rateLimitExtraDelay;
+    }
+
+    const target = Math.min(level * step, this.params.rateLimitPaceMax);
+
+    const delta = target - this.rateLimitExtraDelay;
+    if (delta > 0) {
+      this.rateLimitExtraDelay = target;
+      // maxPageTime is the per-page budget this delay is spent inside, so it
+      // has to grow with it — otherwise slowing down would start timing pages
+      // out, which is a rate limit turning into data loss.
+      this.maxPageTime += delta;
+    }
+
+    return this.rateLimitExtraDelay;
+  }
+
+  /**
+   * Workers allowed to run right now: full concurrency until the crawl has
+   * been refused repeatedly, then one fewer per rung above the threshold.
+   *
+   * A rate limiter counts requests per minute; a concurrency limiter counts
+   * simultaneous connections, and only this lever moves that one. Never below
+   * the configured floor (>= 1), so the crawl always has a runner and can
+   * always finish.
+   */
+  async allowedWorkers(): Promise<number> {
+    const floor = Math.max(1, this.params.rateLimitMinWorkers);
+    const total = this.params.workers;
+
+    if (floor >= total) {
+      return total;
+    }
+
+    const level = await this.crawlState.rateBackoffLevel();
+    const over = level - this.params.rateLimitWorkerThreshold;
+    if (over <= 0) {
+      return total;
+    }
+
+    return Math.max(floor, total - over);
+  }
+
   async awaitPageExtraDelay(opts: WorkerState) {
+    const {
+      data: { url: page },
+      workerid,
+    } = opts;
+
+    const logDetails = { page, workerid };
+
+    // Unconditional extra delay (upstream semantics, off by default).
     if (this.params.pageExtraDelay) {
-      const {
-        data: { url: page },
-        workerid,
-      } = opts;
-
-      const logDetails = { page, workerid };
-
       logger.info(
         `Waiting ${this.params.pageExtraDelay} seconds before moving on to next page`,
         logDetails,
       );
       await sleep(this.params.pageExtraDelay);
+    }
+
+    // Minimum time per page — what actually bounds the request rate.
+    //
+    // A flat delay taxes the wrong pages: one that already spent ten seconds
+    // loading and scrolling is not what trips a limiter, while a 300ms page
+    // fetched back to back is. So this tops a page up to a floor and adds
+    // nothing to pages that already took longer. The rate-limit ratchet raises
+    // the floor rather than adding a second sleep, for the same reason.
+    const floor = this.params.minPageDuration + this.rateLimitExtraDelay;
+    if (!floor) {
+      return;
+    }
+
+    const elapsed = (Date.now() - (opts.pageStartTime || Date.now())) / 1000;
+    const remaining = floor - elapsed;
+
+    if (remaining > 0) {
+      logger.debug(
+        `Page took ${elapsed.toFixed(1)}s, topping up to ${floor}s`,
+        {
+          remaining: +remaining.toFixed(1),
+          floor,
+          elapsed: +elapsed.toFixed(1),
+          ...logDetails,
+        },
+      );
+      await sleep(remaining);
     }
   }
 
@@ -2594,6 +2751,56 @@ self.__bx_behaviors.selectMainBehavior();
     data.status = status;
 
     if (!isChromeError && data.rateLimitStatus) {
+      // Open the shared back-off BEFORE releasing this worker. Without it the
+      // page is requeued and the next one starts within ~200ms, so the crawl's
+      // answer to "you are going too fast" was to go faster: www.amsterdam.nl
+      // was refused three pages per second, and allemaaloisterwijk.nl racked up
+      // 5.002 rate-limited responses in one crawl — enough to earn an IP ban
+      // that outlived the crawl. Retry-After is honoured when the server sends
+      // one; it was already parsed and until now only used as a counter TTL.
+      // Two separate responses, because they answer two different questions.
+      //
+      // The PAUSE waits out the limit that is in force right now. Its length
+      // is the host's to state: Retry-After when sent, otherwise our
+      // configured guess. It does not grow with repetition — waiting longer
+      // does not clear a limit any sooner.
+      //
+      // The PREVENTION ladder answers "why are we here again": every refusal
+      // says the pace we resumed at is still too fast, so the gap between
+      // pages grows and, once that has failed a few times, concurrency drops.
+      //
+      // 429, or any refusal carrying Retry-After, is the host stating plainly
+      // that we are too fast. 403/503 are ambiguous (plenty of sites 403 a
+      // members' area on every crawl, and pausing for those would take days
+      // off a healthy crawl), so those only count where the site says so.
+      const explicit = status === 429 || !!data.rateLimitedRetryAfter;
+
+      if (explicit || this.params.rateLimitPauseAmbiguous) {
+        const seconds = await this.crawlState.setRateBackoff(
+          data.rateLimitedRetryAfter || this.params.rateLimitPause,
+        );
+
+        const level = await this.crawlState.incRateLimitLevel();
+        const pace = this.rateLimitPace(level);
+
+        logger.warn(
+          "Rate limited, backing off",
+          {
+            url,
+            status,
+            seconds,
+            until: new Date(Date.now() + seconds * 1000).toISOString(),
+            level,
+            rateLimitExtraDelay: pace,
+            configuredPageExtraDelay: this.params.pageExtraDelay,
+            allowedWorkers: await this.allowedWorkers(),
+            fromRetryAfter: !!data.rateLimitedRetryAfter,
+            ...logDetails,
+          },
+          "pageStatus",
+        );
+      }
+
       logger.warn(
         "Page possibly rate limited, retrying",
         { url, status, ...logDetails },
