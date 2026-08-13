@@ -78,11 +78,13 @@ disable if a site ever genuinely needs JS off.
 `pageFinished`. `src/actions/index.ts` imports **only** `./postLoad.js`, whose `run()` is an
 empty stub — so in the shipped image this hook does nothing.
 
-`landbouwbrabant.js` and `postLoad-levendigbrabant.ts` are stored alternates (pagination
-clickers), activated historically by copying one over `postLoad.ts` and rebuilding. That is not
-how per-site logic is done now: behaviour/pre-crawl scripts live in the `crawl_scripts` table and
-are injected per crawl, no image rebuild. Keep the hook (cheap, occasionally useful for things a
-page-context behavior cannot do), but do not add new site logic here.
+The stored alternates (`landbouwbrabant.js`, `postLoad-levendigbrabant.ts`) now live in
+`examples/actions/`, outside the compiled and linted tree — they are not imported, and inside
+`src/` they did nothing but fail the pre-commit hook. They were activated historically by copying
+one over `postLoad.ts` and rebuilding. That is not how per-site logic is done now: behaviour and
+pre-crawl scripts live in the `crawl_scripts` table and are injected per crawl, no image rebuild.
+Keep the hook (cheap, occasionally useful for what a page-context behavior cannot do), but do not
+add new site logic here.
 
 ### 6. undici assertion guard
 

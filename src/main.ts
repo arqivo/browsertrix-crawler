@@ -71,7 +71,7 @@ process.on("uncaughtException", (err) => {
     });
     return;
   }
-  logger.fatal("Uncaught exception", {
+  void logger.fatal("Uncaught exception", {
     message: anyErr?.message,
     stack: anyErr?.stack,
   });

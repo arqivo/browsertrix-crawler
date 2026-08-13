@@ -1,11 +1,17 @@
+import { Page } from "puppeteer-core";
+
+import { PageState } from "../util/state.js";
 import { PostLoad } from "./postLoad.js";
 
 export class Actions {
-
-    constructor() {}
-
-    static async runPostLoad(url:any, page:any, logger:any, logDetails: any, crawler: any, data: any){
-        return PostLoad.run(url, page, logger, logDetails, crawler, data);
-    }
-
+  static async runPostLoad(
+    url: string,
+    page: Page,
+    logger: unknown,
+    logDetails: Record<string, unknown>,
+    crawler: unknown,
+    data: PageState,
+  ): Promise<void> {
+    return PostLoad.run(url, page, logger, logDetails, crawler, data);
+  }
 }
