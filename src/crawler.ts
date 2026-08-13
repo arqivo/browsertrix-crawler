@@ -55,6 +55,7 @@ import {
   STATUS_IS_HTML_NO_DIRECT_FETCH,
   STATUS_DNS_ERROR,
   RATE_HOLD_POLL_SECS,
+  RATE_LEVEL_GATE_MIN_SECS,
 } from "./util/constants.js";
 
 import { AdBlockRules, BlockRuleDecl, BlockRules } from "./util/blockrules.js";
@@ -2779,25 +2780,38 @@ self.__bx_behaviors.selectMainBehavior();
           data.rateLimitedRetryAfter || this.params.rateLimitPause,
         );
 
-        const level = await this.crawlState.incRateLimitLevel();
-        const pace = this.rateLimitPace(level);
-
-        logger.warn(
-          "Rate limited, backing off",
-          {
-            url,
-            status,
-            seconds,
-            until: new Date(Date.now() + seconds * 1000).toISOString(),
-            level,
-            rateLimitExtraDelay: pace,
-            configuredPageExtraDelay: this.params.pageExtraDelay,
-            allowedWorkers: await this.allowedWorkers(),
-            fromRetryAfter: !!data.rateLimitedRetryAfter,
-            ...logDetails,
-          },
-          "pageStatus",
+        // Only the first refusal of a burst moves the ladder; the rest are the
+        // same event seen by the other workers.
+        const level = await this.crawlState.incRateLimitLevel(
+          Math.max(seconds, RATE_LEVEL_GATE_MIN_SECS),
         );
+
+        if (level === null) {
+          logger.debug(
+            "Rate limited again inside the open back-off window, not counted",
+            { url, status, ...logDetails },
+            "pageStatus",
+          );
+        } else {
+          const pace = this.rateLimitPace(level);
+
+          logger.warn(
+            "Rate limited, backing off",
+            {
+              url,
+              status,
+              seconds,
+              until: new Date(Date.now() + seconds * 1000).toISOString(),
+              level,
+              rateLimitExtraDelay: pace,
+              configuredPageExtraDelay: this.params.pageExtraDelay,
+              allowedWorkers: await this.allowedWorkers(),
+              fromRetryAfter: !!data.rateLimitedRetryAfter,
+              ...logDetails,
+            },
+            "pageStatus",
+          );
+        }
       }
 
       logger.warn(

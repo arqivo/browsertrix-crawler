@@ -164,6 +164,10 @@ export const RATE_BACKOFF_LEVEL_TTL_SECS = 600;
 // in a tight loop.
 export const RATE_HOLD_POLL_SECS = 5;
 
+// Floor for the ladder gate, so the level cannot climb per-burst even when
+// pausing is switched off (--rateLimitPause 0).
+export const RATE_LEVEL_GATE_MIN_SECS = 5;
+
 export type RateLimitRule = {
   regex: RegExp;
   status: number;

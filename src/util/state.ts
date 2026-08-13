@@ -1195,7 +1195,34 @@ return inx;
    * fewer workers. The level expires after a quiet spell, so a crawl that
    * settles down climbs back to full speed on its own.
    */
-  async incRateLimitLevel(): Promise<number> {
+  async incRateLimitLevel(gateSeconds: number): Promise<number | null> {
+    // One rung per back-off window, not per refusal.
+    //
+    // With four workers a burst of 429s lands within a second or two and each
+    // worker reports its own, so the level used to jump 1->4 on a single
+    // burst: concurrency was shed on evidence that did not exist yet, because
+    // no page had been fetched at the new pace — the crawl was still inside
+    // the pause. Four refusals from one burst are one signal counted four
+    // times.
+    //
+    // The NX gate makes the first refusal in a window the one that counts.
+    // Everything until the pause expires is the same burst; the next rung
+    // needs a FRESH refusal, which is the only thing that actually proves the
+    // pace we resumed at is still too fast. That also paces the ladder by
+    // wall-clock, so the delay lever gets tried before concurrency drops.
+    const gate = Math.max(1, Math.round(gateSeconds));
+    const first = await this.redis.set(
+      this.crawlId + ":rateLevelGate",
+      "1",
+      "EX",
+      gate,
+      "NX",
+    );
+
+    if (first !== "OK") {
+      return null;
+    }
+
     const levelKey = this.crawlId + ":rateBackoffLevel";
     const level = await this.redis.incr(levelKey);
     await this.redis.expire(levelKey, RATE_BACKOFF_LEVEL_TTL_SECS);
