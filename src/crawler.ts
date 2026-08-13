@@ -1452,7 +1452,6 @@ self.__bx_behaviors.selectMainBehavior();
   async awaitRateBackoff(workerid: WorkerId) {
     let announced = false;
 
-     
     while (true) {
       if (this.interruptReason || !(await this.isCrawlRunning())) {
         return;
