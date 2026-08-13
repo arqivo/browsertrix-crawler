@@ -2,7 +2,7 @@
 
 What this fork changes, why, and what to re-check when rebasing onto a new upstream release.
 
-**Base:** upstream `v1.14.0` · **Branch:** `arqivo-1.14.0` · **Image:** `arqivo-browsertrix-crawler:1.14.0-dip2`
+**Base:** upstream `v1.14.0` · **Branch:** `arqivo-1.14.0` · **Image:** `arqivo-browsertrix-crawler:1.14.0-dip3`
 
 Regenerate this view at any time:
 
@@ -23,7 +23,9 @@ git log --oneline v1.14.0..arqivo-1.14.0
 | 6 | undici assertion guard | `src/main.ts` | Low |
 | 7 | Build/push documentation | `Dockerfile` | None (comments only) |
 | 8 | Upstream CI/release workflows deleted | `.github/workflows/*` | None |
-| 9 | Own behaviors bundle (1 autoscroll patch) | `behaviors.js`, `patches/`, `Dockerfile` | **High** — rebuild required on every behaviors version bump |
+| 9 | Own behaviors bundle (2 autoscroll patches) | `behaviors.js`, `patches/`, `Dockerfile` | **High** — rebuild required on every behaviors version bump |
+| 10 | Rate-limit response: pause, then prevent | `src/crawler.ts`, `src/util/{state,worker,argParser,constants}.ts` | **High** — touches the worker loop and the page-timeout budget |
+| 11 | Fork made lint-clean | `src/actions/*`, `src/main.ts`, `src/util/state.ts`, `examples/` | Low |
 
 ---
 
@@ -95,7 +97,90 @@ event and would kill an entire crawl over one broken connection, while undici si
 connection for the next request.
 
 This is the only difference between image tags `1.14.0` and `1.14.0-dip1`. `-dip2` adds the
-behaviors bundle below.
+behaviors bundle below; `-dip3` adds patch 10.
+
+### 10. Rate-limit response: pause, then prevent
+
+Upstream counts rate-limited pages and, past `--rateLimitInterruptCount`, kills the crawl. In
+between it does nothing: the refused page is requeued, the worker takes the next one ~200ms later,
+and `rateLimitMaxRetries` (4) re-requests each refused page. `Retry-After` is parsed and used only
+as a counter TTL — never waited on. So the crawl's answer to "you are going too fast" was to go
+faster. www.amsterdam.nl was refused three pages a second; allemaaloisterwijk.nl collected **5.002**
+rate-limited responses in one crawl and earned an IP ban that also took out onsmoergestel.nl behind
+the same address.
+
+Neither `--pageExtraDelay` nor `--postLoadDelay` can help: both live on the success path, and the
+rate-limit branch `throw`s before either runs.
+
+Two mechanisms, deliberately separate — conflating them was the first draft's mistake:
+
+**Pause** — waits out the limit in force. Length is the host's to state (`Retry-After`, else
+`--rateLimitPause`, 20s). Held as a TTL key in the per-crawl redis so *every* worker waits,
+including ones idle when the refusal arrived. Longest window wins; capped at
+`MAX_RATE_BACKOFF_SECS` (300) because `Retry-After` is occasionally hours. It does **not** grow
+with repetition: waiting longer does not clear a limit sooner.
+
+**Prevention** — every repeat says the pace we resumed at is still too fast. A shared level
+(`{crawlId}:rateBackoffLevel`, TTL `RATE_BACKOFF_LEVEL_TTL_SECS` = 600) raises `--minPageDuration`
+by `--rateLimitPaceStep` per rung up to `--rateLimitPaceMax`, and past
+`--rateLimitWorkerThreshold` rungs drops one worker per further rung, never below
+`--rateLimitMinWorkers`. The level expiring is how a crawl that settles returns to full speed.
+
+Pacing is a **floor, not a tax**: `--minPageDuration` tops a page up to a minimum and adds nothing
+to a page that already took longer — a 300ms page fetched back to back trips limiters, a 10s page
+does not. The learned penalty lives in `crawler.rateLimitExtraDelay`, never in
+`params.pageExtraDelay`, so configuration keeps meaning configuration and the penalty stays
+reportable on its own.
+
+| Flag | Default | |
+|---|---|---|
+| `--rateLimitPause` | 20 | wait-out length when no `Retry-After`; 0 disables pausing |
+| `--rateLimitPauseAmbiguous` | false | count 403/503 without `Retry-After` as rate limiting |
+| `--rateLimitPaceStep` | 1 | seconds added to the floor per rung; 0 disables |
+| `--rateLimitPaceMax` | 10 | ceiling for the added floor |
+| `--rateLimitWorkerThreshold` | 2 | rungs tolerated before dropping a worker |
+| `--rateLimitMinWorkers` | 1 | concurrency floor |
+| `--minPageDuration` | **1** | changed from upstream's implicit 0 |
+
+**Four things that will break if moved, all learned the hard way:**
+
+1. The hold sits in `worker.ts`'s loop **before `nextFromQueue()`**. Inside `crawlPage` it runs
+   within the `timedRun(maxPageTime)` budget, so a long pause times the page out — a rate limit
+   converted into failed pages — and the claimed page goes stale in redis meanwhile.
+2. The hold has **three** release conditions: crawl stopping, no work left
+   (`queueSize() === 0 && numPending() === 0`), hold expired. Drop the middle one and a parked
+   worker sits out its window while the others drain the queue; the concurrency cap has no TTL of
+   its own, so without it a capped worker waits forever and the crawl never finishes.
+3. `maxPageTime` grows with the floor, and `worker.ts` reads `crawler.maxPageTime` **live** rather
+   than the value snapshotted at worker construction. Otherwise slowing down starts timing pages
+   out.
+4. Only the page's own response counts. `recorder.ts` reaches `markRateLimited()` solely from
+   `blockPageResponse()`, guarded by `url === this.pageUrl` — a third-party subresource returning
+   403 can never pause a crawl. Upstream's guard; keep it that way.
+
+**Evidence.** Token-bucket fixture (40 linked pages, 3 requests per 10s, half the 429s carrying
+`Retry-After: 8`), 4 workers, dip3:
+
+| Level | Pause | Source | Floor | Workers |
+|---|---|---|---|---|
+| 1–2 | 8s | `Retry-After` | +1s, +2s | 4 |
+| 3 | 20s | configured | +3s | 3 |
+| 4 | 8s | `Retry-After` | +4s | 2 |
+| 5+ | 8/20s | mixed | +5s … +10s (cap) | 1 (floor) |
+
+Refusals per minute at the host fell **18 → 6 → 3 → 0** and stayed at 0 for the last four minutes;
+all 40 pages captured, `failed: 0`, exit 0 with workers parked. Not yet tested against a real host.
+
+### 11. Fork made lint-clean
+
+The pre-commit hook (`yarn format:fix && eslint src/ tests/*.ts --fix`) had been failing on 35
+errors that all predated this work, so every commit needed `--no-verify` and the hook could catch
+nothing. Fixed: a stray `await` on the synchronous `redis.defineCommand`, an unvoided
+`logger.fatal` in the undici guard, and the `any`-typed actions hook. The two unreferenced
+per-site action variants moved to `examples/actions/` — not imported, not compiled, and inside
+`src/` they only ever failed the hook.
+
+Keep it clean: a hook that always fails is the same as no hook.
 
 ### 7–8. Dockerfile comments, deleted workflows
 
@@ -107,7 +192,7 @@ release, dev-channel and docs-publish workflows are deleted so the fork does not
 ## Behaviors
 
 **Patched.** `behaviors.js` in the repo root is our own build — browsertrix-behaviors **v0.12.3**
-plus `patches/0001-*.patch` — and the Dockerfile copies it over the stock bundle yarn installs.
+plus `patches/000*.patch` (two) — and the Dockerfile copies it over the stock bundle yarn installs.
 Source of truth for the patches is the `arqivo-0.12.3` branch of
 `~/Development/Arqivo/browsertrix-behaviors` (`upstream` remote = webrecorder).
 
@@ -154,8 +239,9 @@ A behaviors patch is not a source change to this repo — the bundle is a depend
 a home and a rebuild trigger of its own:
 
 1. **The patch file lives in `patches/`**, as a `git format-patch` against the upstream behaviors
-   repo. `patches/0001-*.patch` is applied and built into `behaviors.js`; anything under
-   `patches/not-applied/` is kept for its reasoning but deliberately not shipped.
+   repo. `patches/000*.patch` are applied and built into `behaviors.js`; anything under
+   `patches/not-applied/` is kept for its reasoning but deliberately not shipped (named A, B … so
+   the applied series keeps unambiguous numbering).
 2. **Build the bundle in a container**, apply the patch, keep the result out of git (it is
    generated):
    ```bash
@@ -175,7 +261,7 @@ a home and a rebuild trigger of its own:
    before rebuilding. If upstream merged it, delete the file from `patches/` and drop the `COPY`
    line — a silently redundant patch is how forks rot.
 
-### What the patch fixes
+### What the patches fix
 
 **`0001` — the scroll-listener gate never resolves.** Since behaviors 0.10.0, `hasScrollEL()` uses
 `self["getEventListeners"]?.(obj).scroll`. That API only exists in the DevTools console, so the
@@ -184,6 +270,14 @@ optional call short-circuits to `undefined` instead of throwing into the fail-op
 it never run. **Autoscroll never runs at all**, on any page, reproducible on stock
 `webrecorder/browsertrix-crawler:1.14.0` with default arguments. Proposed upstream; drop this
 patch once it lands.
+
+**`0002` — the scroll message is logged ~13 times a second.** `Scrolling down by N pixels` is
+yielded from inside the scroll loop, which turns every 75ms, and the `segments === 1` branch it
+sits in holds for the entire scroll of any page that does not grow. One production crawl of a
+1.500-page site logged **5.600** identical lines — most of that log. The branch has always carried
+the comment *"only print this the first time"*; this adds the flag that makes it true, for both
+`scrollDown` and `scrollUp`. Scrolling itself is unchanged: same pages, same captures, 86 lines to
+1 on a scrolling fixture.
 
 ### Measured effect
 
@@ -234,7 +328,7 @@ fix it — that is the evidence it currently lacks. Apply both together, never `
 cd ~/Development/Arqivo/browsertrix-behaviors
 git fetch upstream --tags
 git checkout -b arqivo-<newver> v<newver>
-git am ~/Development/Arqivo/browsertrix-crawler/patches/0001-*.patch   # drop it once merged upstream
+git am ~/Development/Arqivo/browsertrix-crawler/patches/000*.patch   # drop 0001 once merged upstream
 docker run --rm -v "$PWD:/w" -w /w node:22 sh -c "yarn install --frozen-lockfile && yarn lint:check && yarn run build"
 cp dist/behaviors.js ~/Development/Arqivo/browsertrix-crawler/behaviors.js
 git format-patch v<newver>..HEAD -o ~/Development/Arqivo/browsertrix-crawler/patches/

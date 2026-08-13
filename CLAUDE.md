@@ -20,7 +20,7 @@ image without bumping that constant changes nothing in production.
 
 | Branch | What |
 |---|---|
-| `arqivo-1.14.0` | **current**, base `v1.14.0`, builds `1.14.0-dip2` |
+| `arqivo-1.14.0` | **current**, base `v1.14.0`, builds `1.14.0-dip3` |
 | `arqivo-1.7.0`, `arqivo-1.6.4`, `arqivo-1.2.1`, `arqivo` | previous bases, kept for reference |
 | `main` | upstream tracking |
 
@@ -42,7 +42,7 @@ aws ecr get-login-password --region eu-central-1 | docker login --username AWS -
 docker push 851725346735.dkr.ecr.eu-central-1.amazonaws.com/arqivo-browsertrix-crawler:<version>
 
 # local dev (arm64) — tag must match browsertrixImageOptions()
-docker buildx build --platform linux/arm64 -f Dockerfile -t arqivo-browsertrix-crawler-1.14.0-dip2 .
+docker buildx build --platform linux/arm64 -f Dockerfile -t arqivo-browsertrix-crawler-1.14.0-dip3 .
 ```
 
 Pushing to ECR and bumping the runner is a production change: get explicit approval first.
@@ -132,3 +132,9 @@ patches.
 - **Autoscroll never runs on stock behaviors 0.10+** (upstream defect). Our bundle fixes it from
   `-dip2`; a stock image is the wrong control when testing scroll-dependent capture. Details and
   A/B method in `docs/ARQIVO-PATCHES.md`.
+- **Rate limiting is answered from `-dip3` on** — a refusal pauses every worker, and repeats raise
+  the per-page floor then drop workers. If a crawl looks mysteriously slow, check the log for
+  `Rate limited, backing off` / `Rate limit hold, pausing worker`: it carries `seconds`, `until`,
+  `level` and `allowedWorkers`, and slow is the correct answer to a host refusing us.
+- **The pre-commit hook must stay green.** It was failing on 35 pre-existing errors, so everything
+  was committed with `--no-verify` and it caught nothing; that is fixed, keep it that way.
