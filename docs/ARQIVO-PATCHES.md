@@ -26,6 +26,7 @@ git log --oneline v1.14.0..arqivo-1.14.0
 | 9 | Own behaviors bundle (2 autoscroll patches) | `behaviors.js`, `patches/`, `Dockerfile` | **High** — rebuild required on every behaviors version bump |
 | 10 | Rate-limit response: pause, then prevent | `src/crawler.ts`, `src/util/{state,worker,argParser,constants}.ts` | **High** — touches the worker loop and the page-timeout budget |
 | 11 | Fork made lint-clean | `src/actions/*`, `src/main.ts`, `src/util/state.ts`, `examples/` | Low |
+| 12 | Spill-file purge that cannot kill the crawl | `src/util/recorder.ts` | Low — two call sites plus one private method; drop if upstream awaits `purge()` and warcio ends the stream first |
 
 ---
 
@@ -181,6 +182,41 @@ per-site action variants moved to `examples/actions/` — not imported, not comp
 `src/` they only ever failed the hook.
 
 Keep it clean: a hook that always fails is the same as no hook.
+
+### 12. Spill-file purge that cannot kill the crawl
+
+A response larger than `MAX_BROWSER_DEFAULT_FETCH_SIZE` (5,000,000 bytes) is spilled by warcio's
+`TempFileBuffer` to a temp file. Upstream purges that buffer with a **fire-and-forget**
+`serializer.externalBuffer?.purge()` in two places, and warcio 2.4.11's `purge()` unlinks the file
+**without ending the write stream that creates it**, clearing `filename` only after the unlink
+resolves. So the unlink can run before the stream has created the file, or twice. It rejects with
+`ENOENT`, nothing holds the promise, and the process-level handler turns the unhandled rejection
+into `Uncaught exception. Quitting` — fatal, exit 17, the whole crawl lost.
+
+The **dedupe** path triggers it every night on sites with large static files: an unchanged file
+over the threshold is spilled, found to be a duplicate, and purged at once.
+gemeentemaastricht.nl (static 5.8–7.9 MB election PDFs) crashed on every first attempt from 20
+to 24 Sep 2026, and Deventer's IP block in August came from the retries this crash causes.
+
+Reproduced deterministically against the warcio shipped in `1.14.0-dip4` (spill, then purge the
+way the recorder does):
+
+```
+upstream:  unhandled rejections = 1 | temp file left behind = true
+patch 12:  unhandled rejections = 0 | temp file left behind = false
+```
+
+The second column is a separate upstream bug the fix also closes: when the unlink loses the race,
+the stream creates the file *afterwards* and nothing ever deletes it, so even crawls that survive
+leak every large duplicate into the container's `/tmp`.
+
+`Recorder.purgeSpillBuffer()` ends the stream first — **bounded** at 10 s via `timedRun`, because
+`'finish'` never fires on a stream that has already ended or errored and an unbounded wait would
+hang the recorder — then awaits `purge()` and tolerates the `ENOENT` it can still raise. Anything
+else is logged as a warning, never thrown.
+
+**Rebase check:** if upstream starts awaiting `purge()` and warcio ends the stream inside
+`purge()`, drop this patch.
 
 ### 7–8. Dockerfile comments, deleted workflows
 

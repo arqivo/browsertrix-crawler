@@ -19,7 +19,7 @@ import {
 } from "@webrecorder/wabac";
 
 import { WARCRecord, multiValueHeader } from "warcio";
-import { TempFileBuffer, WARCSerializer } from "warcio/node";
+import { TempFileBuffer, WARCSerializer, streamFinish } from "warcio/node";
 import { WARCWriter } from "./warcwriter.js";
 import { LoadState, PageState, RedisCrawlState, WorkerId } from "./state.js";
 import { CDPSession, Protocol } from "puppeteer-core";
@@ -161,6 +161,58 @@ export class Recorder extends EventEmitter {
   // TODO: Fix this the next time the file is edited.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   logDetails: Record<string, any> = {};
+
+  // ARQIVO PATCH 12 — spill-file purge that cannot kill the crawl.
+  //
+  // A response larger than MAX_BROWSER_DEFAULT_FETCH_SIZE is spilled by
+  // warcio's TempFileBuffer to a temp file. Upstream purged that buffer with
+  // an un-awaited `serializer.externalBuffer?.purge()`, and warcio's purge()
+  // unlinks the file WITHOUT first ending the write stream that creates it,
+  // and only clears `filename` after the unlink resolves. So the unlink can
+  // run before the stream has created the file, or twice; either way it
+  // rejects with ENOENT, nothing holds the promise, and the process-level
+  // handler turns the unhandled rejection into "Uncaught exception.
+  // Quitting" — fatal, exit 17, the whole crawl lost.
+  //
+  // The dedupe path hits this every night on sites with large static files:
+  // an unchanged PDF over the threshold is spilled, found to be a duplicate,
+  // and purged at once. gemeentemaastricht.nl (5.8-7.9 MB election PDFs)
+  // crashed on every first attempt 20-24 Sep 2026; Deventer's IP block in
+  // August came from the retries this crash causes.
+  //
+  // End the stream first, bounded — 'finish' never fires on a stream that has
+  // already ended or errored, so an unbounded wait would hang the recorder —
+  // then purge, awaited, tolerating the ENOENT it can still raise.
+  private async purgeSpillBuffer(serializer: WARCSerializer) {
+    const buffer = serializer.externalBuffer as TempFileBuffer | undefined;
+    if (!buffer) {
+      return;
+    }
+    try {
+      const fh = buffer.fh;
+      if (fh && !fh.writableFinished && !fh.destroyed) {
+        await timedRun(
+          streamFinish(fh),
+          10,
+          "Spill file did not close before purge",
+          this.logDetails,
+          "recorder",
+          true,
+        );
+      }
+      buffer.fh = null;
+      await buffer.purge();
+    } catch (e) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if ((e as any)?.code !== "ENOENT") {
+        logger.warn(
+          "Spill file purge failed",
+          { ...formatErr(e), ...this.logDetails },
+          "recorder",
+        );
+      }
+    }
+  }
 
   pageFinished = false;
 
@@ -1858,7 +1910,7 @@ export class Recorder extends EventEmitter {
       if (
         !(await this.checkStreamingRecordPayload(reqresp, serializer, canRetry))
       ) {
-        serializer.externalBuffer?.purge();
+        await this.purgeSpillBuffer(serializer);
         await this.crawlState.removeDupe(
           [ASYNC_FETCH_DUPE_KEY, WRITE_DUPE_KEY],
           url,
@@ -1930,7 +1982,7 @@ export class Recorder extends EventEmitter {
 
         // always write revisit here
         // duplicate URLs in same crawl filtered out separately
-        serializer.externalBuffer?.purge();
+        await this.purgeSpillBuffer(serializer);
         ({ responseRecord, serializer } = await createRevisitForResponse(
           responseRecord,
           serializer,
