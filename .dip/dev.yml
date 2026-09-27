@@ -1,0 +1,6 @@
+# How a dev bench runs this repository (infra-ops dev environments, B7).
+# Read only while bench.yml is not supported; keep the two in step.
+up: build
+bootstrap: []
+expose: {}
+health: false

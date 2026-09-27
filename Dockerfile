@@ -9,6 +9,9 @@
 #   Local dev (arm64), the tag HarvestService::browsertrixImageOptions() expects:
 #     docker buildx build --platform linux/arm64 -f Dockerfile -t arqivo-browsertrix-crawler-1.14.0 .
 #
+#   Development stack (native platform, arqivo-browsertrix-crawler:dev, which
+#   the runners get as BROWSERTRIX_IMAGE): docker compose -f compose.dev.yml build
+#
 ARG BROWSER_VERSION=1.91.175
 ARG BROWSER_IMAGE_BASE=webrecorder/browsertrix-browser-base:brave-${BROWSER_VERSION}
 

@@ -1,0 +1,9 @@
+# How a dev bench handles the Arqivo crawler (infra-ops B9 contract): a
+# build-only repo. `docker compose build` makes arqivo-browsertrix-crawler:dev
+# (native platform, ~2.7 GB — built once per bench and kept); task runners
+# start it per crawl.
+
+up: build
+bootstrap: []
+expose: {}
+health: false

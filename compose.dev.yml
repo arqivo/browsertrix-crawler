@@ -1,0 +1,18 @@
+# The Arqivo crawler image for a development stack. Build-only (`up: build` in
+# bench.yml): the task runner starts it per crawl as BROWSERTRIX_IMAGE.
+#
+#   docker compose -f compose.dev.yml --env-file .env.example build
+#
+# Built for the machine it runs on (amd64 on a dev bench, arm64 on Apple
+# silicon); ~2.7 GB and a long build, so build once and keep the image.
+# Production images are built and pushed by hand (see the Dockerfile header).
+# docker-compose.yml is upstream's and is left alone.
+
+services:
+  browsertrix:
+    image: ${BROWSERTRIX_IMAGE:-arqivo-browsertrix-crawler:dev}
+    build:
+      context: .
+    pull_policy: build
+    command: ["crawl", "--version"]
+    restart: "no"
