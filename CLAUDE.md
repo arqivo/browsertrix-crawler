@@ -138,3 +138,9 @@ patches.
   `level` and `allowedWorkers`, and slow is the correct answer to a host refusing us.
 - **The pre-commit hook must stay green.** It was failing on 35 pre-existing errors, so everything
   was committed with `--no-verify` and it caught nothing; that is fixed, keep it that way.
+
+## Delivery (infra-ops)
+
+- **One image per commit**: `.github/workflows/image.yml` builds every pushed commit on every branch, pushes `ghcr.io/arqivo/browsertrix-crawler:<sha>` (+ `<sha7>`, `<branch>`) and reports it to the InfraOps plane as a build of application `browsertrix-crawler` (`POST /v2/applications/browsertrix-crawler/builds`; variable `INFRAOPS_URL`, secret `INFRAOPS_DEPLOY_TOKEN`; unset = skipped with a warning). Production images are still built and pushed to ECR by hand (above); a GHCR build does not reach a crawl until a `task_runner_releases` row names it.
+- **`version.json`** `{"commit", "build", "manifest"}` is baked into the image (at `/version.json` in the image filesystem); `build` is the workflow's run number, the same number reported to the plane.
+- **Image mode** (`compose.image.yml`, used by validation benches): pulls `BROWSERTRIX_CRAWLER_IMAGE`; arqivo-task-host hands it to the runners as `BROWSERTRIX_IMAGE`.

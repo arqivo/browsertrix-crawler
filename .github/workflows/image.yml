@@ -1,0 +1,103 @@
+# Arqivo crawler image: build the image of every pushed commit, on every branch, push it to
+# GHCR and report it to the InfraOps plane as a build of application
+# `browsertrix-crawler` (infra-ops plan-changes C0/C3: one image per build, `version.json`
+# with the commit baked in). Additive: production images are still built and pushed to ECR by hand (Dockerfile header).
+#
+#   push (any branch)  → ghcr.io/arqivo/browsertrix-crawler:<sha>, :<sha7>, :<branch>
+#
+# Repository variable INFRAOPS_URL (e.g. https://infra.dip.is) and secret
+# INFRAOPS_DEPLOY_TOKEN (the application's deploy token); either unset → the
+# report step warns and skips. GHCR push uses the built-in GITHUB_TOKEN.
+name: image
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Every commit gets its build; a newer push never cancels an older one (a
+# cancelled run would read as a failed CI to the plane).
+concurrency:
+  group: image-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/arqivo/browsertrix-crawler
+  APPLICATION: browsertrix-crawler
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and OCI labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            dev.infraops.build-number=${{ github.run_number }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          # Loaded into the runner's daemon as well, for the smoke test below.
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_NUMBER=${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: version.json carries this commit
+        run: |
+          v="$(docker run --rm --entrypoint "" "$IMAGE:$GITHUB_SHA" cat /version.json)"
+          echo "$v"
+          test "$(jq -r .commit <<<"$v")" = "$GITHUB_SHA"
+          test "$(jq -r .build <<<"$v")" = "${{ github.run_number }}"
+
+      - name: Smoke test — the crawler starts
+        run: docker run --rm "$IMAGE:$GITHUB_SHA" crawl --version
+
+      - name: Report the build to the plane
+        env:
+          INFRAOPS_URL: ${{ vars.INFRAOPS_URL }}
+          INFRAOPS_DEPLOY_TOKEN: ${{ secrets.INFRAOPS_DEPLOY_TOKEN }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+        run: .github/scripts/report-build.sh

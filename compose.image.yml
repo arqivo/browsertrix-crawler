@@ -1,0 +1,13 @@
+# Image mode for a dev bench (B7.5) and the plane's validation benches: use a
+# built crawler image (BROWSERTRIX_CRAWLER_IMAGE, set by the plane from the
+# application's build) instead of building one (~2.7 GB). Overlays
+# compose.dev.yml; `up` pulls it onto the daemon and runs `crawl --version`.
+#
+# The runners start it per crawl: arqivo-task-host's compose.image.yml hands
+# the same BROWSERTRIX_CRAWLER_IMAGE to them as BROWSERTRIX_IMAGE.
+
+services:
+  browsertrix:
+    image: ${BROWSERTRIX_CRAWLER_IMAGE:?BROWSERTRIX_CRAWLER_IMAGE is not set}
+    build: !reset null
+    pull_policy: missing

@@ -97,6 +97,16 @@ COPY behaviors.js /app/node_modules/browsertrix-behaviors/dist/behaviors.js
 RUN mkdir -p /etc/brave/policies/managed/
 ADD config/policies /etc/brave/policies/managed/
 
+# The build's identity (infra-ops plan-changes C3): {commit, build, manifest}
+# in /version.json, the commit also as the OCI revision label. Set by CI
+# (image.yml); a local build without the arguments writes nulls.
+ARG GIT_COMMIT=""
+ARG BUILD_NUMBER=""
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}"
+RUN printf '{"commit":%s,"build":%s,"manifest":null}\n' \
+      "$( [ -n "$GIT_COMMIT" ] && printf '"%s"' "$GIT_COMMIT" || echo null )" \
+      "$( [ -n "$BUILD_NUMBER" ] && echo "$BUILD_NUMBER" || echo null )" > /version.json
+
 ADD docker-entrypoint.sh /docker-entrypoint.sh
 ENTRYPOINT ["/docker-entrypoint.sh"]
 
